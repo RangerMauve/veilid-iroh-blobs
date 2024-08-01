@@ -1,0 +1,14 @@
+[package]
+name = "veilid-iroh-blobs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+bytes = "1.6.1"
+futures-lite = "2.3.0"
+iroh-blobs = "0.20.0"
+tmpdir = "1.0.0"
+tokio = "1.39.1"
+tracing = "0.1.40"
+veilid-core = "0.3.3"
