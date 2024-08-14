@@ -1,17 +1,240 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use anyhow::Ok;
 use anyhow::{anyhow, Result};
 use bytes::Buf;
 use bytes::BufMut;
 use bytes::Bytes;
 use bytes::BytesMut;
-use tokio::sync::mpsc::channel;
+use std::collections::HashMap;
+use std::io::Write;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
-use veilid_core::{RouteId, RoutingContext, Target, VeilidUpdate};
+use tokio::sync::Mutex;
+use veilid_core::CryptoKey;
+use veilid_core::OperationId;
+use veilid_core::VeilidAPI;
+use veilid_core::VeilidAppCall;
+use veilid_core::{RouteId, RoutingContext, Target, VeilidUpdate, CRYPTO_KEY_LENGTH};
 
+pub type Tunnel = (Sender<Vec<u8>>, Receiver<Vec<u8>>);
+pub type TunnelId = (RouteId, u32);
+pub type OnNewTunnelCallback = Arc<dyn Fn(Tunnel) + Send + Sync>;
+
+// SAVE on a phone pad
+static PING_BYTES: &'static [u8] = &[7, 2, 8, 3];
+
+#[repr(u8)]
+pub enum TunnelResult {
+    Success = 0,
+    InvalidFormat = 1,
+    Closed = 2,
+}
+
+struct TunnelManagerInner {
+    router: RoutingContext,
+    route_id: RouteId,
+    id_counter: u32,
+    senders: HashMap<TunnelId, Sender<Vec<u8>>>,
+}
+
+pub struct TunnelManager {
+    inner: Arc<Mutex<TunnelManagerInner>>,
+    route_id: RouteId,
+    veilid: VeilidAPI,
+    on_new_tunnel: Option<OnNewTunnelCallback>,
+}
+
+impl TunnelManagerInner {
+    async fn send_ping(&self, id: &TunnelId) -> Result<()> {
+        let bytes = self.route_id.bytes.to_vec();
+
+        return self.send_bytes(id, bytes).await;
+    }
+
+    async fn send_bytes(&self, id: &TunnelId, bytes: Vec<u8>) -> Result<()> {
+        // TODO: Don't unwrap
+        let mut buffer = BytesMut::with_capacity(bytes.len() + 4 + CRYPTO_KEY_LENGTH);
+        buffer.put(id.0.bytes.to_vec().as_slice());
+        buffer.put_u32(id.1);
+        buffer.put(bytes.as_slice());
+        let target = Target::PrivateRoute(id.0);
+        let result = self.router.app_call(target, buffer.to_vec()).await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) => Err(anyhow!("{}", err)),
+        }
+    }
+
+    async fn notify_bytes(&self, id: &TunnelId, bytes: &[u8]) -> Result<()> {
+        let sender = self.senders.get(id);
+
+        if !sender.is_some() {
+            return Err(anyhow!("Unknown tunnel id"));
+        }
+
+        return sender
+            .unwrap()
+            .send(bytes.to_vec())
+            .await
+            .map_err(|err| anyhow!("Unable to send: {}", err));
+    }
+}
+
+impl TunnelManager {
+    async fn track(&self, id: &TunnelId) -> Result<Tunnel> {
+        let (man_to_tun, from_man_to_tun) = mpsc::channel(100);
+        let (tun_to_man, mut from_tun_to_man) = mpsc::channel(100);
+
+        {
+            let mut inner = self.inner.lock().await;
+
+            inner.senders.insert(*id, man_to_tun);
+        }
+
+        let inner = self.inner.clone();
+        let id = id.clone();
+
+        tokio::spawn(async move {
+            while let Some(bytes) = from_tun_to_man.recv().await {
+                let inner = inner.lock().await;
+                let result = inner.send_bytes(&id, bytes).await;
+                if result.is_err() {
+                    // TODO: report tunnel close somewhere? Should close one end once we break
+                    eprint!("{}", result.unwrap_err());
+                    break;
+                }
+            }
+        });
+
+        {
+            let inner = self.inner.lock().await;
+            inner.send_ping(&id).await?;
+        }
+
+        return Ok((tun_to_man, from_man_to_tun));
+    }
+
+    async fn reply(&self, call_id: OperationId, message: Vec<u8>) -> Result<()> {
+        return self
+            .veilid
+            .app_call_reply(call_id, message)
+            .await
+            .map_err(|err| anyhow!("{}", err));
+    }
+
+    async fn reply_result(&self, call_id: OperationId, result: TunnelResult) -> Result<()> {
+        return self.reply(call_id, vec![result as u8]).await;
+    }
+
+    async fn handle_new(&self, id: &TunnelId, message: &[u8]) -> Result<()> {
+        if !message.eq(PING_BYTES) {
+            return Err(anyhow!(
+                "Got invalid length for ping, expected 32 byte crypto key"
+            ));
+        }
+
+        let tunnel = self.track(id).await?;
+
+        if self.on_new_tunnel.is_some() {
+            self.on_new_tunnel.as_ref().unwrap()(tunnel);
+        }
+
+        return Ok(());
+    }
+
+    async fn send_to_tunnel(&self, id: &TunnelId, bytes: &[u8]) -> Result<()> {
+        let inner = self.inner.lock().await;
+        return inner.notify_bytes(id, bytes).await;
+    }
+
+    async fn has_tunnel(&self, id: &TunnelId) -> bool {
+        let inner = self.inner.lock().await;
+        return inner.senders.contains_key(id);
+    }
+
+    async fn handle_message(
+        &self,
+        id: &TunnelId,
+        message: &[u8],
+        call_id: OperationId,
+    ) -> Result<()> {
+        if self.has_tunnel(id).await {
+            // TODO: log failed sends?
+            let result = if self.send_to_tunnel(id, message).await.is_ok() {
+                TunnelResult::Success
+            } else {
+                TunnelResult::Closed
+            };
+
+            return self.reply_result(call_id, result).await;
+        }
+
+        let result = if self.handle_new(id, message).await.is_ok() {
+            TunnelResult::Success
+        } else {
+            TunnelResult::Closed
+        };
+
+        return self.reply_result(call_id, result).await;
+    }
+
+    async fn handle_app_call(&self, appcall: &Box<VeilidAppCall>) -> Result<()> {
+        let call_id = appcall.id();
+
+        // No route or wrong route means it's prob from elsewhere
+        if !appcall.route_id().is_some() {
+            return Ok(());
+        }
+        let route_id = appcall.route_id().unwrap();
+        if route_id != &self.route_id {
+            return Ok(());
+        }
+
+        let mut buffer = Bytes::copy_from_slice(appcall.message());
+
+        // THis is all to read 32 bytes into a fixed buffer 💀
+        let route_id_buffer = buffer.get(0..32);
+        if route_id_buffer.is_none() {
+            return self
+                .reply_result(call_id, TunnelResult::InvalidFormat)
+                .await;
+        }
+        let route_id_buffer = route_id_buffer.unwrap();
+        let mut route_key_raw: [u8; CRYPTO_KEY_LENGTH] = [0; CRYPTO_KEY_LENGTH];
+        route_key_raw.writer().write(route_id_buffer)?;
+        let route_key = CryptoKey::from(route_key_raw);
+
+        let tunnel_number = buffer.get_u32();
+        let bytes = buffer.chunk();
+
+        let id: TunnelId = (route_key, tunnel_number);
+
+        self.handle_message(&id, bytes, call_id).await?;
+
+        return Ok(());
+    }
+
+    pub async fn listen(&self, mut updates: Receiver<VeilidUpdate>) -> Result<()> {
+        while let Some(update) = updates.recv().await {
+            println!("got = {:?}", update);
+            match &update {
+                VeilidUpdate::AppCall(appcall) => {
+                    self.handle_app_call(appcall);
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "Invalid update type passed to TunnelManager, expected AppCall"
+                    ))
+                }
+            }
+        }
+
+        return Ok(());
+    }
+}
+
+/*
 pub struct TunnelManager {
     router: RoutingContext,
     route_id: RouteId,
@@ -219,3 +442,4 @@ impl TunnelManager {
         return self.id_counter;
     }
 }
+ */
