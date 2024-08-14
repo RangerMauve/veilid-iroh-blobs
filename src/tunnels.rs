@@ -37,6 +37,7 @@ struct TunnelManagerInner {
     senders: HashMap<TunnelId, Sender<Vec<u8>>>,
 }
 
+#[derive(Clone)]
 pub struct TunnelManager {
     inner: Arc<Mutex<TunnelManagerInner>>,
     route_id: RouteId,
@@ -106,11 +107,6 @@ impl TunnelManager {
                 }
             }
         });
-
-        {
-            let inner = self.inner.lock().await;
-            inner.send_ping(&id).await?;
-        }
 
         return Ok((tun_to_man, from_man_to_tun));
     }
@@ -215,20 +211,76 @@ impl TunnelManager {
         return Ok(());
     }
 
-    pub async fn listen(&self, mut updates: Receiver<VeilidUpdate>) -> Result<()> {
-        while let Some(update) = updates.recv().await {
-            println!("got = {:?}", update);
-            match &update {
-                VeilidUpdate::AppCall(appcall) => {
-                    self.handle_app_call(appcall);
-                }
-                _ => {
-                    return Err(anyhow!(
-                        "Invalid update type passed to TunnelManager, expected AppCall"
-                    ))
-                }
-            }
+    pub async fn from_veilid(
+        veilid: VeilidAPI,
+        on_new_tunnel: Option<OnNewTunnelCallback>,
+    ) -> Result<Self> {
+        let router = veilid.routing_context()?;
+        let (route_id, _) = veilid.new_private_route().await?;
+
+        return Ok(Self::new(veilid, router, route_id, on_new_tunnel));
+    }
+
+    pub fn new(
+        veilid: VeilidAPI,
+        router: RoutingContext,
+        route_id: RouteId,
+        on_new_tunnel: Option<OnNewTunnelCallback>,
+    ) -> Self {
+        let inner = Arc::new(Mutex::new(TunnelManagerInner {
+            route_id,
+            router,
+            senders: HashMap::new(),
+            id_counter: 0,
+        }));
+
+        let tunnels = TunnelManager {
+            route_id,
+            inner,
+            veilid,
+            on_new_tunnel,
+        };
+
+        return tunnels;
+    }
+
+    pub fn route_id(&self) -> RouteId {
+        return self.route_id;
+    }
+
+    pub async fn open(&self, route_id: RouteId) -> Result<Tunnel> {
+        let mut tunnel_id: u32;
+        {
+            let mut inner = self.inner.lock().await;
+            inner.id_counter += 1;
+            tunnel_id = inner.id_counter;
         }
+
+        let id: TunnelId = (route_id, tunnel_id);
+
+        let tunnel = self.track(&id).await?;
+
+        {
+            let inner = self.inner.lock().await;
+            inner.send_ping(&id).await?;
+        }
+
+        return Ok(tunnel);
+    }
+
+    pub async fn listen(
+        &self,
+        mut updates: tokio::sync::broadcast::Receiver<VeilidUpdate>,
+    ) -> Result<()> {
+        while let Ok(update) = updates.recv().await {
+            if let VeilidUpdate::AppCall(appcall) = update {
+                println!("got appcall in manager");
+                self.handle_app_call(&appcall).await?;
+            }
+            println!("Got event in manager");
+        }
+
+        println!("FInished listening to updates");
 
         return Ok(());
     }
