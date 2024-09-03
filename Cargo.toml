@@ -5,13 +5,14 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.86"
+backtrace-on-stack-overflow = "0.3.0"
 bytes = "1.6.1"
 ciborium = "0.2.2"
 futures-lite = "2.3.0"
-iroh-blobs = "0.20.0"
+iroh-blobs = "0.23.0"
 rdefer = "1.0.0"
 serde = "1.0.207"
 tmpdir = "1.0.0"
 tokio = "1.39.1"
 tracing = "0.1.40"
-veilid-core = "0.3.3"
+veilid-core = { git = "https://gitlab.com/veilid/veilid.git", version = "0.3.4" }

@@ -14,6 +14,7 @@ use veilid_core::CryptoKey;
 use veilid_core::OperationId;
 use veilid_core::VeilidAPI;
 use veilid_core::VeilidAppCall;
+use veilid_core::VeilidAppMessage;
 use veilid_core::{RouteId, RoutingContext, Target, VeilidUpdate, CRYPTO_KEY_LENGTH};
 
 pub type Tunnel = (Sender<Vec<u8>>, Receiver<Vec<u8>>);
@@ -54,12 +55,15 @@ impl TunnelManagerInner {
 
     async fn send_bytes(&self, id: &TunnelId, bytes: Vec<u8>) -> Result<()> {
         // TODO: Don't unwrap
-        let mut buffer = BytesMut::with_capacity(bytes.len() + 4 + CRYPTO_KEY_LENGTH);
+        println!("sending bytes");
+        let mut buffer: BytesMut = BytesMut::with_capacity(bytes.len() + 4 + CRYPTO_KEY_LENGTH);
         buffer.put(id.0.bytes.to_vec().as_slice());
         buffer.put_u32(id.1);
         buffer.put(bytes.as_slice());
         let target = Target::PrivateRoute(id.0);
-        let result = self.router.app_call(target, buffer.to_vec()).await;
+        let result = self.router.app_message(target, buffer.to_vec()).await;
+
+        println!("sent bytes");
 
         match result {
             Ok(_) => Ok(()),
@@ -112,6 +116,7 @@ impl TunnelManager {
     }
 
     async fn reply(&self, call_id: OperationId, message: Vec<u8>) -> Result<()> {
+        println!("sending reply {call_id}");
         return self
             .veilid
             .app_call_reply(call_id, message)
@@ -124,15 +129,19 @@ impl TunnelManager {
     }
 
     async fn handle_new(&self, id: &TunnelId, message: &[u8]) -> Result<()> {
+        println!("handling new");
         if !message.eq(PING_BYTES) {
             return Err(anyhow!(
-                "Got invalid length for ping, expected 32 byte crypto key"
+                "Got invalid length for ping: {:?}\n Expected: {:?}",
+                message,
+                PING_BYTES
             ));
         }
 
         let tunnel = self.track(id).await?;
 
         if self.on_new_tunnel.is_some() {
+            println!("calling on_new callback");
             self.on_new_tunnel.as_ref().unwrap()(tunnel);
         }
 
@@ -149,52 +158,45 @@ impl TunnelManager {
         return inner.senders.contains_key(id);
     }
 
-    async fn handle_message(
-        &self,
-        id: &TunnelId,
-        message: &[u8],
-        call_id: OperationId,
-    ) -> Result<()> {
+    async fn handle_message(&self, id: &TunnelId, message: &[u8]) -> Result<()> {
+        println!("handling incoming message");
         if self.has_tunnel(id).await {
-            // TODO: log failed sends?
-            let result = if self.send_to_tunnel(id, message).await.is_ok() {
-                TunnelResult::Success
-            } else {
-                TunnelResult::Closed
-            };
+            println!("existing tunnel");
 
-            return self.reply_result(call_id, result).await;
+            // TODO: Log failed requests?
+            if let Err(err) = self.send_to_tunnel(id, message).await {
+                eprintln!("Unable to send data to tunnel {:?}", err);
+            };
         }
 
-        let result = if self.handle_new(id, message).await.is_ok() {
-            TunnelResult::Success
-        } else {
-            TunnelResult::Closed
+        if let Err(err) = self.handle_new(id, message).await {
+            eprintln!("Unable to handle new tunnel {:?}", err);
         };
 
-        return self.reply_result(call_id, result).await;
+        return Ok(());
     }
 
-    async fn handle_app_call(&self, appcall: &Box<VeilidAppCall>) -> Result<()> {
-        let call_id = appcall.id();
-
+    async fn handle_app_call(&self, app_messsage: &Box<VeilidAppMessage>) -> Result<()> {
         // No route or wrong route means it's prob from elsewhere
-        if !appcall.route_id().is_some() {
+        if !app_messsage.route_id().is_some() {
+            println!("app call without route");
             return Ok(());
         }
-        let route_id = appcall.route_id().unwrap();
+        let route_id = app_messsage.route_id().unwrap();
         if route_id != &self.route_id {
+            println!("app call for other route");
             return Ok(());
         }
 
-        let mut buffer = Bytes::copy_from_slice(appcall.message());
+        print!("handling app call");
+
+        let mut buffer = Bytes::copy_from_slice(app_messsage.message());
 
         // THis is all to read 32 bytes into a fixed buffer 💀
         let route_id_buffer = buffer.get(0..32);
         if route_id_buffer.is_none() {
-            return self
-                .reply_result(call_id, TunnelResult::InvalidFormat)
-                .await;
+            println!("Missing route id buffer in app call");
+            return Ok(());
         }
         let route_id_buffer = route_id_buffer.unwrap();
         let mut route_key_raw: [u8; CRYPTO_KEY_LENGTH] = [0; CRYPTO_KEY_LENGTH];
@@ -206,7 +208,7 @@ impl TunnelManager {
 
         let id: TunnelId = (route_key, tunnel_number);
 
-        self.handle_message(&id, bytes, call_id).await?;
+        self.handle_message(&id, bytes).await?;
 
         return Ok(());
     }
@@ -248,8 +250,9 @@ impl TunnelManager {
         return self.route_id;
     }
 
-    pub async fn open(&self, route_id: RouteId) -> Result<Tunnel> {
-        let mut tunnel_id: u32;
+    pub async fn open(&self, route_id_blob: Vec<u8>) -> Result<Tunnel> {
+        let route_id = self.veilid.import_remote_private_route(route_id_blob)?;
+        let tunnel_id: u32;
         {
             let mut inner = self.inner.lock().await;
             inner.id_counter += 1;
@@ -273,11 +276,11 @@ impl TunnelManager {
         mut updates: tokio::sync::broadcast::Receiver<VeilidUpdate>,
     ) -> Result<()> {
         while let Ok(update) = updates.recv().await {
-            if let VeilidUpdate::AppCall(appcall) = update {
+            if let VeilidUpdate::AppMessage(app_message) = update {
                 println!("got appcall in manager");
-                self.handle_app_call(&appcall).await?;
+                self.handle_app_call(&app_message).await?;
             }
-            println!("Got event in manager");
+            //println!("Got event in manager");
         }
 
         println!("FInished listening to updates");
