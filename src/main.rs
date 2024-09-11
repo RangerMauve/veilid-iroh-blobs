@@ -1,10 +1,16 @@
+use anyhow::anyhow;
 use anyhow::Result;
-use iroh_blobs::store::fs::Store;
+use std::result;
+// use iroh_blobs::store::fs::Store;
 use std::{path::PathBuf, sync::Arc};
-use tmpdir::TmpDir;
+// use tmpdir::TmpDir;
+use tokio::time::{sleep, Duration};
 use tokio::{
     join,
-    sync::{broadcast, mpsc},
+    sync::{
+        broadcast,
+        mpsc::{self, Receiver},
+    },
 };
 use tracing::info;
 use veilid_core::{
@@ -18,17 +24,23 @@ use crate::tunnels::TunnelManager;
 
 struct VeilidIrohBlobs {
     tunnels: TunnelManager,
-    store: Store,
+    //store: Store,
 }
 
 impl VeilidIrohBlobs {
-    pub fn new(veilid: VeilidAPI, router: RoutingContext, route_id: RouteId, store: Store) -> Self {
+    pub fn new(
+        veilid: VeilidAPI,
+        router: RoutingContext,
+        route_id: RouteId, /*, store: Store*/
+    ) -> Self {
         let on_new_tunnel = Arc::new(|tunnel| {
             println!("{:?}", tunnel);
         });
 
         let tunnels = TunnelManager::new(veilid, router, route_id, Some(on_new_tunnel));
-        VeilidIrohBlobs { store, tunnels }
+        VeilidIrohBlobs {
+            /*store,*/ tunnels,
+        }
     }
 
     /*
@@ -65,10 +77,10 @@ async fn basic_test() {
 
 #[tokio::test]
 async fn test_tunnel() {
-    unsafe { backtrace_on_stack_overflow::enable() }
+    //unsafe { backtrace_on_stack_overflow::enable() }
 
-    let tmp = TmpDir::new("test_dweb_backend").await.unwrap();
-    let base_dir = tmp.to_path_buf();
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
 
     /* four threads
     veilid cb -> updates channel
@@ -86,21 +98,20 @@ async fn test_tunnel() {
     let read_update1 = read_update;
     let read_update2 = send_update.subscribe();
 
-    // Initialize Veilid
-    let update_callback: UpdateCallback = Arc::new(move |update| {
-        info!("Received update: {:?}", update);
-        if let Err(err) = send_update.send(update) {
-            eprintln!("Unable to process veilid update: {:?}", err);
+    let (veilid, mut rx) = init_veilid(Some("tunnels_test_1".to_string()), &base_dir.join("peer1"))
+        .await
+        .expect("Unable to init veilid and store");
+
+    let sender_handle = tokio::spawn(async move {
+        while let Some(update) = rx.recv().await {
+            //println!("Received update: {:#?}", update);
+            if let Err(err) = send_update.send(update) {
+                eprintln!("Unable to process veilid update: {:?}", err);
+            }
         }
     });
 
-    let veilid = init_veilid(
-        Some("tunnels_test_1".to_string()),
-        &base_dir.join("peer1"),
-        update_callback,
-    )
-    .await
-    .expect("Unable to init veilid and store");
+    println!("Cloning veilid API for tunnels");
 
     let v1 = veilid.clone();
     let v2 = veilid.clone();
@@ -108,25 +119,11 @@ async fn test_tunnel() {
     println!("Initializing route1");
 
     let router1 = v1.routing_context().unwrap();
-    let (route_id1, route_id1_blob) = v1
-        .new_custom_private_route(
-            &VALID_CRYPTO_KINDS,
-            veilid_core::Stability::Reliable,
-            veilid_core::Sequencing::NoPreference,
-        )
-        .await
-        .unwrap();
+    let (route_id1, route_id1_blob) = make_route(&v1).await.unwrap();
 
     println!("Initializing route2");
     let router2 = v2.routing_context().unwrap();
-    let (route_id2, route_id2_blob) = v2
-        .new_custom_private_route(
-            &VALID_CRYPTO_KINDS,
-            veilid_core::Stability::Reliable,
-            veilid_core::Sequencing::NoPreference,
-        )
-        .await
-        .unwrap();
+    let (route_id2, route_id2_blob) = make_route(&v2).await.unwrap();
 
     println!("Routes ready");
 
@@ -144,20 +141,23 @@ async fn test_tunnel() {
     let tunnels2 = TunnelManager::new(v2, router2, route_id2, None);
 
     println!("Spawn tunnel1");
-    let tunnel1_handle = AbortOnDropHandle::new(tokio::spawn(async move {
+    let tunnel1_handle = tokio::spawn(async move {
+        println!("Listening in tunnel1");
         tunnels1.listen(read_update1).await.unwrap();
-    }));
+    });
 
     println!("Spawn tunnel2");
-    let tunnel2_handle = AbortOnDropHandle::new(tokio::spawn(async move {
+    let tunnel2_handle = tokio::spawn(async move {
         let listening = tunnels2.clone();
         tokio::spawn(async move {
             println!("Listening in tunnel2");
             listening.listen(read_update2).await.unwrap();
         });
 
+        sleep(Duration::from_secs(10)).await;
+
         let result = tunnels2.open(route_id1_blob).await;
-        println!("Tunnel opened, sending data");
+        println!("Tunnel opened");
         send_result2
             .send(if result.is_ok() {
                 Ok(())
@@ -168,7 +168,7 @@ async fn test_tunnel() {
             })
             .await
             .unwrap();
-    }));
+    });
 
     println!("wait result1");
 
@@ -178,40 +178,33 @@ async fn test_tunnel() {
     read_result.recv().await.unwrap().unwrap();
 
     println!("cleanup");
+    sender_handle.abort();
+    tunnel1_handle.abort();
+    tunnel2_handle.abort();
     veilid.shutdown().await;
-
-    tmp.close().await.unwrap();
 }
 
 async fn init_veilid(
     namespace: Option<String>,
     base_dir: &PathBuf,
-    update_callback: UpdateCallback,
-) -> Result<VeilidAPI> {
+) -> Result<(VeilidAPI, Receiver<VeilidUpdate>)> {
     let config_inner = config_for_dir(base_dir.to_path_buf(), namespace);
 
-    let (tx, mut rx) = mpsc::channel(1);
+    let (tx, mut rx) = mpsc::channel(32);
 
-    let mut is_done = false;
-
-    let update_callback_local: UpdateCallback = Arc::new(move |update| {
-        //info!("Received update: {:?}", update);
-        if is_done {
-            return;
-        }
-
+    let update_callback: UpdateCallback = Arc::new(move |update| {
         let tx = tx.clone();
-
         tokio::spawn(async move {
-            // TODO: 🤷
-            if let Err(_) = tx.clone().send(update).await {
-                is_done = true;
+            if let Err(_) = tx.send(update).await {
+                // TODO:
+                println!("receiver dropped");
+                return;
             }
         });
     });
 
     println!("Init veilid");
-    let veilid = veilid_core::api_startup_config(update_callback_local, config_inner).await?;
+    let veilid = veilid_core::api_startup_config(update_callback, config_inner).await?;
 
     println!("Attach veilid");
 
@@ -221,7 +214,7 @@ async fn init_veilid(
 
     while let Some(update) = rx.recv().await {
         if let VeilidUpdate::Attachment(attachment_state) = update {
-            if attachment_state.public_internet_ready {
+            if attachment_state.public_internet_ready && attachment_state.state.is_attached() {
                 println!("Public internet ready!");
                 break;
             }
@@ -230,119 +223,65 @@ async fn init_veilid(
 
     println!("Network ready");
 
-    tokio::spawn(async move {
-        while let Some(update) = rx.recv().await {
-            update_callback(update)
-        }
-    });
+    return Ok((veilid, rx));
+}
 
-    return Ok(veilid);
+async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
+    let mut retries = 3;
+    while (retries != 0) {
+        retries -= 1;
+        let result = veilid
+            .new_custom_private_route(
+                &VALID_CRYPTO_KINDS,
+                veilid_core::Stability::Reliable,
+                veilid_core::Sequencing::PreferOrdered,
+            )
+            .await;
+
+        if (result.is_ok()) {
+            return Ok(result.unwrap());
+        }
+    }
+    return Err(anyhow!("Unable to create route, reached max retries"));
 }
 
 async fn init_deps(
     namespace: Option<String>,
     base_dir: &PathBuf,
-    update_callback: UpdateCallback,
-) -> Result<(VeilidAPI, Store)> {
-    let store = Store::load(base_dir.join("iroh")).await?;
+) -> Result<(VeilidAPI, Receiver<VeilidUpdate> /*, Store*/)> {
+    //let store = Store::load(base_dir.join("iroh")).await?;
 
-    let veilid = init_veilid(namespace, base_dir, update_callback).await?;
+    let (veilid, rx) = init_veilid(namespace, base_dir).await?;
 
-    return Ok((veilid, store));
+    return Ok((veilid, rx /*store*/));
 }
 
 fn config_for_dir(base_dir: PathBuf, namespace: Option<String>) -> VeilidConfigInner {
-    let namespace: String = namespace.unwrap_or("iroh-blobs-".to_string());
+    let namespace: String = namespace.unwrap_or("iroh-blobs".to_string());
     return VeilidConfigInner {
         program_name: "iroh-blobs".to_string(),
         namespace,
-        capabilities: Default::default(),
         protected_store: veilid_core::VeilidConfigProtectedStore {
             // avoid prompting for password, don't do this in production
-            allow_insecure_fallback: true,
             always_use_insecure_storage: true,
             directory: base_dir
                 .join("protected_store")
                 .to_string_lossy()
                 .to_string(),
-            delete: false,
-            device_encryption_key_password: "".to_string(),
-            new_device_encryption_key_password: None,
+            ..Default::default()
         },
         table_store: veilid_core::VeilidConfigTableStore {
             directory: base_dir.join("table_store").to_string_lossy().to_string(),
-            delete: false,
+            ..Default::default()
         },
         block_store: veilid_core::VeilidConfigBlockStore {
             directory: base_dir.join("block_store").to_string_lossy().to_string(),
-            delete: false,
+            ..Default::default()
         },
-        network: Default::default(),
+        ..Default::default()
     };
 }
 
 fn main() {
     println!("Hello, world!");
-}
-
-// Taken from https://github.com/tokio-rs/tokio/blob/1ac8dff213937088616dc84de9adc92b4b68c49a/tokio-util/src/task/abort_on_drop.rs
-use tokio::task::{AbortHandle, JoinError, JoinHandle};
-
-use std::{
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-};
-
-/// A wrapper around a [`tokio::task::JoinHandle`],
-/// which [aborts] the task when it is dropped.
-///
-/// [aborts]: tokio::task::JoinHandle::abort
-#[must_use = "Dropping the handle aborts the task immediately"]
-#[derive(Debug)]
-pub struct AbortOnDropHandle<T>(JoinHandle<T>);
-
-impl<T> Drop for AbortOnDropHandle<T> {
-    fn drop(&mut self) {
-        self.0.abort()
-    }
-}
-
-impl<T> AbortOnDropHandle<T> {
-    /// Create an [`AbortOnDropHandle`] from a [`JoinHandle`].
-    pub fn new(handle: JoinHandle<T>) -> Self {
-        Self(handle)
-    }
-
-    /// Abort the task associated with this handle,
-    /// equivalent to [`JoinHandle::abort`].
-    pub fn abort(&self) {
-        self.0.abort()
-    }
-
-    /// Checks if the task associated with this handle is finished,
-    /// equivalent to [`JoinHandle::is_finished`].
-    pub fn is_finished(&self) -> bool {
-        self.0.is_finished()
-    }
-
-    /// Returns a new [`AbortHandle`] that can be used to remotely abort this task,
-    /// equivalent to [`JoinHandle::abort_handle`].
-    pub fn abort_handle(&self) -> AbortHandle {
-        self.0.abort_handle()
-    }
-}
-
-impl<T> Future for AbortOnDropHandle<T> {
-    type Output = Result<T, JoinError>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.0).poll(cx)
-    }
-}
-
-impl<T> AsRef<JoinHandle<T>> for AbortOnDropHandle<T> {
-    fn as_ref(&self) -> &JoinHandle<T> {
-        &self.0
-    }
 }

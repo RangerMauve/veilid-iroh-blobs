@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use bytes::buf;
 use bytes::Buf;
 use bytes::BufMut;
 use bytes::Bytes;
@@ -13,7 +14,6 @@ use tokio::sync::Mutex;
 use veilid_core::CryptoKey;
 use veilid_core::OperationId;
 use veilid_core::VeilidAPI;
-use veilid_core::VeilidAppCall;
 use veilid_core::VeilidAppMessage;
 use veilid_core::{RouteId, RoutingContext, Target, VeilidUpdate, CRYPTO_KEY_LENGTH};
 
@@ -48,14 +48,15 @@ pub struct TunnelManager {
 
 impl TunnelManagerInner {
     async fn send_ping(&self, id: &TunnelId) -> Result<()> {
-        let bytes = self.route_id.bytes.to_vec();
+        let bytes = PING_BYTES.to_vec();
+        println!("Sending ping");
 
         return self.send_bytes(id, bytes).await;
     }
 
     async fn send_bytes(&self, id: &TunnelId, bytes: Vec<u8>) -> Result<()> {
         // TODO: Don't unwrap
-        println!("sending bytes");
+        println!("sending bytes {:?}", bytes);
         let mut buffer: BytesMut = BytesMut::with_capacity(bytes.len() + 4 + CRYPTO_KEY_LENGTH);
         buffer.put(id.0.bytes.to_vec().as_slice());
         buffer.put_u32(id.1);
@@ -63,7 +64,7 @@ impl TunnelManagerInner {
         let target = Target::PrivateRoute(id.0);
         let result = self.router.app_message(target, buffer.to_vec()).await;
 
-        println!("sent bytes");
+        println!("sent bytes {:?}", buffer.to_vec());
 
         match result {
             Ok(_) => Ok(()),
@@ -176,7 +177,7 @@ impl TunnelManager {
         return Ok(());
     }
 
-    async fn handle_app_call(&self, app_messsage: &Box<VeilidAppMessage>) -> Result<()> {
+    async fn handle_app_message(&self, app_messsage: &Box<VeilidAppMessage>) -> Result<()> {
         // No route or wrong route means it's prob from elsewhere
         if !app_messsage.route_id().is_some() {
             println!("app call without route");
@@ -188,7 +189,7 @@ impl TunnelManager {
             return Ok(());
         }
 
-        print!("handling app call");
+        println!("handling app call");
 
         let mut buffer = Bytes::copy_from_slice(app_messsage.message());
 
@@ -202,6 +203,9 @@ impl TunnelManager {
         let mut route_key_raw: [u8; CRYPTO_KEY_LENGTH] = [0; CRYPTO_KEY_LENGTH];
         route_key_raw.writer().write(route_id_buffer)?;
         let route_key = CryptoKey::from(route_key_raw);
+
+        // Apparently .get(index) doesn't advance the buffer 🤷
+        buffer.advance(32);
 
         let tunnel_number = buffer.get_u32();
         let bytes = buffer.chunk();
@@ -278,7 +282,7 @@ impl TunnelManager {
         while let Ok(update) = updates.recv().await {
             if let VeilidUpdate::AppMessage(app_message) = update {
                 println!("got appcall in manager");
-                self.handle_app_call(&app_message).await?;
+                self.handle_app_message(&app_message).await?;
             }
             //println!("Got event in manager");
         }
