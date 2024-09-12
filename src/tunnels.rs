@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use bytes::buf;
 use bytes::Buf;
 use bytes::BufMut;
 use bytes::Bytes;
@@ -12,7 +11,6 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Mutex;
 use veilid_core::CryptoKey;
-use veilid_core::OperationId;
 use veilid_core::VeilidAPI;
 use veilid_core::VeilidAppMessage;
 use veilid_core::{RouteId, RoutingContext, Target, VeilidUpdate, CRYPTO_KEY_LENGTH};
