@@ -1,6 +1,8 @@
 use anyhow::anyhow;
 use anyhow::Result;
+use core::str;
 use std::result;
+use tunnels::OnNewTunnelCallback;
 // use iroh_blobs::store::fs::Store;
 use std::{path::PathBuf, sync::Arc};
 // use tmpdir::TmpDir;
@@ -31,13 +33,15 @@ impl VeilidIrohBlobs {
     pub fn new(
         veilid: VeilidAPI,
         router: RoutingContext,
+        route_id_blob: Vec<u8>,
         route_id: RouteId, /*, store: Store*/
     ) -> Self {
         let on_new_tunnel = Arc::new(|tunnel| {
             println!("{:?}", tunnel);
         });
 
-        let tunnels = TunnelManager::new(veilid, router, route_id, Some(on_new_tunnel));
+        let tunnels =
+            TunnelManager::new(veilid, router, route_id, route_id_blob, Some(on_new_tunnel));
         VeilidIrohBlobs {
             /*store,*/ tunnels,
         }
@@ -127,18 +131,63 @@ async fn test_tunnel() {
 
     println!("Routes ready");
 
-    let on_new_tunnel1 = Arc::new(move |tunnel| {
+    let on_new_tunnel1: OnNewTunnelCallback = Arc::new(move |tunnel| {
         println!("New tunnel {:?}", tunnel);
 
         let send_result1 = send_result1.clone();
 
         tokio::spawn(async move {
             send_result1.send(Ok(())).await.unwrap();
+
+            let (sender, mut reader) = tunnel;
+
+            let result = reader.recv().await;
+
+            if result.is_none() {
+                send_result1
+                    .send(Err(anyhow!("Unable to read first message")))
+                    .await
+                    .unwrap();
+                return;
+            }
+
+            let raw = result.unwrap();
+
+            let message = str::from_utf8(&raw.as_slice()).unwrap();
+
+            if message.eq("Hello World!") {
+                send_result1.send(Ok(())).await.unwrap();
+            } else {
+                send_result1
+                    .send(Err(anyhow!("Got invalid message from tunnel {0}", message)))
+                    .await
+                    .unwrap();
+            }
+
+            let result = sender.send("Goodbye World!".as_bytes().to_vec()).await;
+
+            send_result1
+                .send(if let Ok(_) = result {
+                    Ok(())
+                } else {
+                    Err(anyhow!(
+                        "Unable to send response tunnel {:?}",
+                        result.unwrap_err()
+                    ))
+                })
+                .await
+                .unwrap();
         });
     });
 
-    let tunnels1 = TunnelManager::new(v1, router1, route_id1, Some(on_new_tunnel1));
-    let tunnels2 = TunnelManager::new(v2, router2, route_id2, None);
+    let tunnels1 = TunnelManager::new(
+        v1,
+        router1,
+        route_id1,
+        route_id1_blob.clone(),
+        Some(on_new_tunnel1),
+    );
+    let tunnels2 = TunnelManager::new(v2, router2, route_id2, route_id2_blob, None);
 
     println!("Spawn tunnel1");
     let tunnel1_handle = tokio::spawn(async move {
@@ -157,25 +206,65 @@ async fn test_tunnel() {
         sleep(Duration::from_secs(10)).await;
 
         let result = tunnels2.open(route_id1_blob).await;
+
+        if (result.is_err()) {
+            send_result2.send(Err(result.unwrap_err())).await.unwrap();
+            return;
+        }
+
         println!("Tunnel opened");
+        send_result2.send(Ok(())).await.unwrap();
+
+        let (sender, mut reader) = result.unwrap();
+
+        // STart reading so the chanel isn't marked as closed
+        let read_result = reader.recv();
+        let result = sender.send("Hello World!".as_bytes().to_vec()).await;
+
         send_result2
-            .send(if result.is_ok() {
+            .send(if let Ok(_) = result {
                 Ok(())
             } else {
-                let err = result.unwrap_err();
-                eprintln!("Unable to open tunnel. {:?}", err);
-                Err(err)
+                Err(anyhow!(
+                    "Unable to send down tunnel {:?}",
+                    result.unwrap_err()
+                ))
             })
             .await
             .unwrap();
+
+        let result = read_result.await;
+
+        if result.is_none() {
+            send_result2
+                .send(Err(anyhow!("Unable to read first message")))
+                .await
+                .unwrap();
+            return;
+        }
+
+        let raw = result.unwrap();
+
+        let message = str::from_utf8(&raw.as_slice()).unwrap();
+
+        if message.eq("Goodbye World!") {
+            send_result2.send(Ok(())).await.unwrap();
+        } else {
+            send_result2
+                .send(Err(anyhow!("Got invalid message from tunnel {0}", message)))
+                .await
+                .unwrap();
+        }
     });
 
-    println!("wait result1");
+    let expected = 6;
+    let mut count = 0;
 
-    read_result.recv().await.unwrap().unwrap();
-
-    println!("wait result2");
-    read_result.recv().await.unwrap().unwrap();
+    while count < expected {
+        println!("wait result {0}", count + 1);
+        count += 1;
+        read_result.recv().await.unwrap().unwrap();
+    }
 
     println!("cleanup");
     sender_handle.abort();
@@ -234,11 +323,11 @@ async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
             .new_custom_private_route(
                 &VALID_CRYPTO_KINDS,
                 veilid_core::Stability::Reliable,
-                veilid_core::Sequencing::PreferOrdered,
+                veilid_core::Sequencing::EnsureOrdered,
             )
             .await;
 
-        if (result.is_ok()) {
+        if result.is_ok() {
             return Ok(result.unwrap());
         }
     }
