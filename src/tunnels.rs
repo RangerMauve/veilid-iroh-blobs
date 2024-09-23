@@ -41,6 +41,7 @@ struct TunnelManagerInner {
 pub struct TunnelManager {
     inner: Arc<Mutex<TunnelManagerInner>>,
     route_id: RouteId,
+    route_id_blob: Vec<u8>,
     veilid: VeilidAPI,
     on_new_tunnel: Option<OnNewTunnelCallback>,
 }
@@ -54,8 +55,8 @@ impl TunnelManagerInner {
         return self.send_bytes(id, bytes).await;
     }
 
+    // TODO: Don't unwrap
     async fn send_bytes(&self, id: &TunnelId, bytes: Vec<u8>) -> Result<()> {
-        // TODO: Don't unwrap
         println!(
             "{0} sending bytes to {1:?} {2:?}",
             self.route_id, id.0, bytes
@@ -77,7 +78,6 @@ impl TunnelManagerInner {
 
     async fn notify_bytes(&self, id: &TunnelId, bytes: &[u8]) -> Result<()> {
         let sender = self.senders.get(id);
-
         if !sender.is_some() {
             return Err(anyhow!("Unknown tunnel id"));
         }
@@ -172,7 +172,7 @@ impl TunnelManager {
                     "{0} Unable to send data to tunnel {1:?}",
                     self.route_id, err
                 );
-            };
+            }
         } else {
             if let Err(err) = self.handle_new(id, message).await {
                 eprintln!("{0} Unable to handle new tunnel {1:?}", self.route_id, err);
@@ -247,7 +247,7 @@ impl TunnelManager {
     ) -> Self {
         let inner = Arc::new(Mutex::new(TunnelManagerInner {
             route_id,
-            route_id_blob,
+            route_id_blob: route_id_blob.clone(),
             router,
             senders: HashMap::new(),
             id_counter: 0,
@@ -255,6 +255,7 @@ impl TunnelManager {
 
         let tunnels = TunnelManager {
             route_id,
+            route_id_blob,
             inner,
             veilid,
             on_new_tunnel,
@@ -265,6 +266,10 @@ impl TunnelManager {
 
     pub fn route_id(&self) -> RouteId {
         return self.route_id;
+    }
+
+    pub fn route_id_blob(&self) -> Vec<u8> {
+        return self.route_id_blob.clone();
     }
 
     pub async fn open(&self, route_id_blob: Vec<u8>) -> Result<Tunnel> {
@@ -302,6 +307,12 @@ impl TunnelManager {
 
         println!("{0} FInished listening to updates", self.route_id);
 
+        return Ok(());
+    }
+
+    pub async fn shutdown(self) -> Result<()> {
+        // TODO: close routes and tunnels first?
+        self.veilid.shutdown().await;
         return Ok(());
     }
 }

@@ -17,5 +17,6 @@ iroh-io = "0.6.1"
 # serde = "1.0.207"
 # tmpdir = "1.0.0"
 tokio = {version = "~1.39", features = ["full", "tracing"]}
+tokio-stream = "0.1.16"
 tracing = "0.1.40"
 veilid-core = { git = "https://gitlab.com/veilid/veilid.git", branch = "main" }

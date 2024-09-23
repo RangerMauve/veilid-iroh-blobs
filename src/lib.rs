@@ -147,7 +147,7 @@ async fn test_tunnel() {
 
         let result = tunnels2.open(route_id1_blob).await;
 
-        if (result.is_err()) {
+        if result.is_err() {
             send_result2.send(Err(result.unwrap_err())).await.unwrap();
             return;
         }
@@ -272,17 +272,6 @@ async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
         }
     }
     return Err(anyhow!("Unable to create route, reached max retries"));
-}
-
-async fn init_deps(
-    namespace: Option<String>,
-    base_dir: &PathBuf,
-) -> Result<(VeilidAPI, Receiver<VeilidUpdate> /*, Store*/)> {
-    //let store = Store::load(base_dir.join("iroh")).await?;
-
-    let (veilid, rx) = init_veilid(namespace, base_dir).await?;
-
-    return Ok((veilid, rx /*store*/));
 }
 
 fn config_for_dir(base_dir: PathBuf, namespace: Option<String>) -> VeilidConfigInner {
