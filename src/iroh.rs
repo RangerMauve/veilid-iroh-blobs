@@ -37,6 +37,7 @@ const YES: u8 = 0x01u8;
 const HAS: u8 = 0x10u8;
 const ASK: u8 = 0x11u8;
 const DATA: u8 = 0x20u8;
+const DONE: u8 = 0x22u8;
 const ERR: u8 = 0xF0u8;
 
 #[derive(Clone)]
@@ -152,6 +153,7 @@ impl VeilidIrohBlobs {
                                 }
                             }
                         }
+                        let _ = send.send(vec![DONE]).await;
                     } else {
                         let _ = send.send(vec![ERR]).await;
                     }
@@ -208,14 +210,17 @@ impl VeilidIrohBlobs {
         let tunnel = self.tunnels.open(route_id_blob).await?;
         let hash_bytes = hash.as_bytes();
         let mut to_send = BytesMut::with_capacity(hash_bytes.len() + 1);
-        to_send.put_u8(HAS);
+        to_send.put_u8(ASK);
         to_send.put(hash_bytes.as_slice());
 
         let (send, mut read) = tunnel;
 
         send.send(to_send.to_vec()).await?;
 
+        println!("Sent ask, waiting for answer");
+
         if let Some(result) = read.recv().await {
+            println!("Got response");
             if result.len() != 1 {
                 return Err(anyhow!(
                     "Invalid response length from peer {}",
@@ -239,6 +244,10 @@ impl VeilidIrohBlobs {
                             return;
                         }
                         let command = message[0];
+
+                        if command == DONE {
+                            break;
+                        }
 
                         if command != DATA {
                             let _ = send_file
