@@ -23,11 +23,15 @@ use iroh_io::AsyncSliceReader;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Command;
+use std::result;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 use veilid_core::{RouteId, RoutingContext, VeilidAPI, VeilidUpdate};
@@ -40,10 +44,13 @@ const DATA: u8 = 0x20u8;
 const DONE: u8 = 0x22u8;
 const ERR: u8 = 0xF0u8;
 
+const DEFAULT_TIMEOUT: Duration = Duration::from_millis(4000);
+
 #[derive(Clone)]
 pub struct VeilidIrohBlobs {
     tunnels: TunnelManager,
     store: iroh_blobs::store::fs::Store,
+    handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl VeilidIrohBlobs {
@@ -86,21 +93,34 @@ impl VeilidIrohBlobs {
 
         let listening = tunnels.clone();
 
-        let blobs = VeilidIrohBlobs { store, tunnels };
+        let handles = Arc::new(Mutex::new(Vec::with_capacity(2)));
+
+        let blobs = VeilidIrohBlobs {
+            store,
+            tunnels,
+            handles: handles.clone(),
+        };
 
         let listening_blobs = blobs.clone();
 
-        tokio::spawn(async move {
+        let tunnels_handle = tokio::spawn(async move {
             listening.listen(updates).await.unwrap();
         });
-        tokio::spawn(async move {
+        let blobs_handle = tokio::spawn(async move {
             listening_blobs.listen(read_tunnel).await.unwrap();
         });
+
+        let mut handles = handles.lock().unwrap();
+        handles.push(tunnels_handle);
+        handles.push(blobs_handle);
 
         return blobs;
     }
 
     pub async fn shutdown(self) -> Result<()> {
+        let handles = self.handles.lock().unwrap();
+        handles[0].abort();
+        handles[1].abort();
         self.tunnels.shutdown().await?;
         self.store.shutdown().await;
         return Ok(());
@@ -118,7 +138,15 @@ impl VeilidIrohBlobs {
     async fn handle_tunnel(&self, tunnel: Tunnel) {
         let (send, mut read) = tunnel;
 
-        if let Some(message) = read.recv().await {
+        let read_result = timeout(DEFAULT_TIMEOUT, read.recv()).await;
+
+        if !read_result.is_ok() {
+            // Tunnel likely closed
+            // TODO: log error?
+            return;
+        }
+
+        if let Some(message) = read_result.unwrap() {
             let command = message[0];
             let hash_bytes = &message[1..];
             if command == ASK || command == HAS {
@@ -138,7 +166,13 @@ impl VeilidIrohBlobs {
                 }
                 if command == ASK {
                     if let Result::Ok(mut file) = self.read_file(hash).await {
-                        while let Some(chunk) = file.recv().await {
+                        while let Result::Ok(read_result) =
+                            timeout(DEFAULT_TIMEOUT, file.recv()).await
+                        {
+                            if !read_result.is_some() {
+                                break;
+                            }
+                            let chunk = read_result.unwrap();
                             if chunk.is_err() {
                                 let _ = send.send(vec![ERR]).await;
                                 return;
@@ -184,26 +218,27 @@ impl VeilidIrohBlobs {
         send.send(to_send.to_vec()).await?;
 
         println!("Sent HAS, waiting for response");
-        if let Some(result) = read.recv().await {
-            println!("Got answer {:?}", result.clone());
-            if result.len() != 1 {
-                return Err(anyhow!(
-                    "Invalid response length from peer {}",
-                    result.len()
-                ));
-            }
+        if let Result::Ok(read_result) = timeout(DEFAULT_TIMEOUT, read.recv()).await {
+            if let Some(result) = read_result {
+                if result.len() != 1 {
+                    return Err(anyhow!(
+                        "Invalid response length from peer {}",
+                        result.len()
+                    ));
+                }
 
-            let command = result[0];
-            if command == YES {
-                return Ok(true);
-            } else if command == NO {
-                return Ok(false);
-            } else {
-                return Err(anyhow!("Invalid response code from peer {:?}", command));
+                let command = result[0];
+                if command == YES {
+                    return Ok(true);
+                } else if command == NO {
+                    return Ok(false);
+                } else {
+                    return Err(anyhow!("Invalid response code from peer {:?}", command));
+                }
             }
-        } else {
-            return Err(anyhow!("Unable to ask peer"));
         }
+
+        return Err(anyhow!("Unable to ask peer"));
     }
 
     pub async fn download_file_from(&self, route_id_blob: Vec<u8>, hash: &Hash) -> Result<()> {
@@ -219,67 +254,75 @@ impl VeilidIrohBlobs {
 
         println!("Sent ask, waiting for answer");
 
-        if let Some(result) = read.recv().await {
-            println!("Got response");
-            if result.len() != 1 {
-                return Err(anyhow!(
-                    "Invalid response length from peer {}",
-                    result.len()
-                ));
-            }
-
-            let command = result[0];
-            if command == YES {
-                let (send_file, read_file) = mpsc::channel::<std::io::Result<Bytes>>(2);
-
-                tokio::spawn(async move {
-                    while let Some(message) = read.recv().await {
-                        if message.len() < 1 {
-                            let _ = send_file
-                                .send(std::io::Result::Err(std::io::Error::new(
-                                    ErrorKind::InvalidData,
-                                    "Peer sent empty message",
-                                )))
-                                .await;
-                            return;
-                        }
-                        let command = message[0];
-
-                        if command == DONE {
-                            break;
-                        }
-
-                        if command != DATA {
-                            let _ = send_file
-                                .send(std::io::Result::Err(std::io::Error::new(
-                                    ErrorKind::InvalidData,
-                                    format!("Peer sent unexpected command {}", command),
-                                )))
-                                .await;
-                            return;
-                        }
-                        let bytes = Bytes::from_iter(message[1..].to_vec());
-                        if let Err(_) = send_file.send(std::io::Result::Ok(bytes)).await {
-                            return;
-                        }
-                    }
-                });
-                let got_hash = self.upload_from_stream(read_file).await?;
-
-                if got_hash.eq(hash) {
-                    return Ok(());
-                } else {
-                    self.store.delete(vec![got_hash]).await?;
-                    return Err(anyhow!("Peer returned invalid hash {}", got_hash));
+        if let Result::Ok(read_result) = timeout(DEFAULT_TIMEOUT, read.recv()).await {
+            if let Some(result) = read_result {
+                println!("Got response");
+                if result.len() != 1 {
+                    return Err(anyhow!(
+                        "Invalid response length from peer {}",
+                        result.len()
+                    ));
                 }
-            } else if command == NO {
-                return Err(anyhow!("Peer does not have hash"));
-            } else {
-                return Err(anyhow!("Invalid response code from peer {:?}", command));
+
+                let command = result[0];
+                if command == YES {
+                    let (send_file, read_file) = mpsc::channel::<std::io::Result<Bytes>>(2);
+
+                    tokio::spawn(async move {
+                        while let Result::Ok(read_result) =
+                            timeout(DEFAULT_TIMEOUT, read.recv()).await
+                        {
+                            if read_result.is_none() {
+                                break;
+                            }
+                            let message = read_result.unwrap();
+
+                            if message.len() < 1 {
+                                let _ = send_file
+                                    .send(std::io::Result::Err(std::io::Error::new(
+                                        ErrorKind::InvalidData,
+                                        "Peer sent empty message",
+                                    )))
+                                    .await;
+                                return;
+                            }
+                            let command = message[0];
+
+                            if command == DONE {
+                                break;
+                            }
+
+                            if command != DATA {
+                                let _ = send_file
+                                    .send(std::io::Result::Err(std::io::Error::new(
+                                        ErrorKind::InvalidData,
+                                        format!("Peer sent unexpected command {}", command),
+                                    )))
+                                    .await;
+                                return;
+                            }
+                            let bytes = Bytes::from_iter(message[1..].to_vec());
+                            if let Err(_) = send_file.send(std::io::Result::Ok(bytes)).await {
+                                return;
+                            }
+                        }
+                    });
+                    let got_hash = self.upload_from_stream(read_file).await?;
+
+                    if got_hash.eq(hash) {
+                        return Ok(());
+                    } else {
+                        self.store.delete(vec![got_hash]).await?;
+                        return Err(anyhow!("Peer returned invalid hash {}", got_hash));
+                    }
+                } else if command == NO {
+                    return Err(anyhow!("Peer does not have hash"));
+                } else {
+                    return Err(anyhow!("Invalid response code from peer {:?}", command));
+                }
             }
-        } else {
-            return Err(anyhow!("Unable to ask peer"));
         }
+        return Err(anyhow!("Unable to ask peer"));
     }
 
     pub async fn upload_from_path(&self, file: PathBuf) -> Result<Hash> {
@@ -450,7 +493,7 @@ async fn test_blob_replication() {
 
     let has = blobs2.has_hash(&hash).await;
 
-    println!("Blobs has hash after download: {}", has);
+    assert!(has, "Blobs has hash after download");
 
     sender_handle.abort();
 }

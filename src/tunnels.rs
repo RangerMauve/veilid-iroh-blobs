@@ -88,12 +88,35 @@ impl TunnelManagerInner {
             .await
             .map_err(|err| anyhow!("Unable to send: {}", err));
     }
+
+    async fn handle_remote_dead(&mut self, routes: &[CryptoKey]) {
+        for route_id in routes {
+            for id in self.senders.clone().keys() {
+                if id.0 == *route_id {
+                    self.senders.remove(id);
+                }
+            }
+        }
+    }
+    async fn handle_local_dead(&mut self, routes: &[CryptoKey]) {
+        for route_id in routes {
+            if *route_id != self.route_id {
+                continue;
+            }
+            for id in self.senders.keys() {
+                if id.0 == *route_id {
+                    let _ = self.notify_bytes(id, &[]).await;
+                }
+            }
+        }
+        self.senders.clear();
+    }
 }
 
 impl TunnelManager {
     async fn track(&self, id: &TunnelId) -> Result<Tunnel> {
         let (man_to_tun, from_man_to_tun) = mpsc::channel(100);
-        let (tun_to_man, mut from_tun_to_man) = mpsc::channel(100);
+        let (tun_to_man, mut from_tun_to_man) = mpsc::channel::<Vec<u8>>(100);
 
         {
             let mut inner = self.inner.lock().await;
@@ -107,6 +130,10 @@ impl TunnelManager {
 
         tokio::spawn(async move {
             while let Some(bytes) = from_tun_to_man.recv().await {
+                if bytes.len() == 0 {
+                    // Signal that the tunnel is closed
+                    break;
+                }
                 let inner = inner.lock().await;
                 let result = inner.send_bytes(&id, bytes).await;
                 if result.is_err() {
@@ -222,6 +249,16 @@ impl TunnelManager {
         return Ok(());
     }
 
+    async fn handle_remote_dead(&self, routes: &[CryptoKey]) {
+        let mut inner = self.inner.lock().await;
+        inner.handle_remote_dead(routes).await
+    }
+
+    async fn handle_local_dead(&self, routes: &[CryptoKey]) {
+        let mut inner = self.inner.lock().await;
+        inner.handle_local_dead(routes).await
+    }
+
     pub async fn from_veilid(
         veilid: VeilidAPI,
         on_new_tunnel: Option<OnNewTunnelCallback>,
@@ -301,6 +338,14 @@ impl TunnelManager {
             if let VeilidUpdate::AppMessage(app_message) = update {
                 println!("{0} got appcall in manager", self.route_id);
                 self.handle_app_message(&app_message).await?;
+            } else if let VeilidUpdate::RouteChange(route_change) = update {
+                if route_change.dead_remote_routes.len() != 0 {
+                    self.handle_remote_dead(&route_change.dead_remote_routes)
+                        .await;
+                }
+                if route_change.dead_routes.len() != 0 {
+                    self.handle_local_dead(&route_change.dead_routes).await;
+                }
             }
             //println!("{0} Got event in manager");
         }
