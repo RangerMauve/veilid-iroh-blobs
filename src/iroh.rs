@@ -16,15 +16,19 @@ use iroh_blobs::store::ImportProgress;
 use iroh_blobs::store::Map;
 use iroh_blobs::store::ReadableStore;
 use iroh_blobs::store::Store;
+use iroh_blobs::format::collection::{Collection, SimpleStore};
 use iroh_blobs::util::progress::IgnoreProgressSender;
 use iroh_blobs::BlobFormat;
 use iroh_blobs::Hash;
+use std::pin::Pin;
+use std::collections::HashMap;
+
 use iroh_io::AsyncSliceReader;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Command;
-use std::result;
 use std::sync::Mutex;
+use std::result;
 use std::time::Duration;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::broadcast;
@@ -381,6 +385,20 @@ impl VeilidIrohBlobs {
         return Ok(read);
     }
 
+    pub async fn create_collection(&self, collection_name: String) -> Result<Hash> {
+        // Initialize an empty collection
+        let mut collection = Collection::default();
+
+        // Store the collection in the store.   
+        let temp_tag = collection.store(&self.store).await?;
+
+        // Call hash on the temp_tag
+        let root_hash = temp_tag.hash();
+
+        // Return the root hash of the collection
+        Ok(*root_hash)
+    }
+
     pub fn route_id_blob(&self) -> Vec<u8> {
         return self.tunnels.route_id_blob();
     }
@@ -496,4 +514,33 @@ async fn test_blob_replication() {
     assert!(has, "Blobs has hash after download");
 
     sender_handle.abort();
+}
+#[tokio::test]
+async fn test_create_collection() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    // Initialize the blobs instance
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None)
+        .await
+        .unwrap();
+
+    // Call create_collection method
+    let collection_name = "my_test_collection".to_string();
+    let collection_hash = blobs.create_collection(collection_name.clone()).await.unwrap();
+
+    // Ensure the collection hash is not empty
+    assert!(!collection_hash.as_bytes().is_empty(), "Collection hash should not be empty");
+
+    println!("Created collection with hash: {}", collection_hash);
+
+    // Verify that the collection exists in the store
+    let has_collection = blobs.has_hash(&collection_hash).await;
+    assert!(
+        has_collection,
+        "Blobs should have the collection hash after creation"
+    );
+
+    // Clean up by shutting down blobs instance
+    blobs.shutdown().await.unwrap();
 }
