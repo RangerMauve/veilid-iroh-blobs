@@ -21,6 +21,7 @@ use iroh_blobs::HashAndFormat;
 use iroh_blobs::BlobFormat;
 use iroh_blobs::Hash;
 use iroh_blobs::Tag;
+use iroh_io::AsyncSliceReaderExt;
 use std::pin::Pin;
 use std::collections::HashMap;
 use iroh_io::AsyncSliceReader;
@@ -33,6 +34,7 @@ use std::result;
 use std::time::Duration;
 use std::future::Future;
 use std::{path::PathBuf, sync::Arc};
+use std::borrow::Borrow;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::mpsc;
@@ -56,17 +58,11 @@ const ERR: u8 = 0xF0u8;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(4000);
 
-#[derive(Serialize, Deserialize, Debug, Default)]
-pub struct Collection {
-    files: HashMap<String, Hash>,
-}
-
 #[derive(Clone)]
 pub struct VeilidIrohBlobs {
     tunnels: TunnelManager,
     store: iroh_blobs::store::fs::Store,
     handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    collection_hashes: Arc<RwLock<HashMap<String, Hash>>>,
     base_dir: PathBuf,
 }
 
@@ -84,30 +80,8 @@ impl VeilidIrohBlobs {
             route_id,
             updates,
             store,
-            base_dir.clone(), // Pass base_dir
+            base_dir.clone(), 
         );
-    
-        // Load the collection_hashes HashMap
-        let hash_file_path = base_dir.join("collection_hashes_hash");
-        if hash_file_path.exists() {
-            let hash_str = std::fs::read_to_string(hash_file_path)?;
-            let hash_bytes = hex::decode(hash_str.trim())?;
-            if hash_bytes.len() != 32 {
-                return Err(anyhow!("Invalid hash length: expected 32 bytes, got {}", hash_bytes.len()));
-            }
-            let hash_array: [u8; 32] = hash_bytes.as_slice().try_into().unwrap();
-            let hash = Hash::from_bytes(hash_array);
-
-            // Retrieve the serialized HashMap from the store
-            let serialized_map = blobs.read_bytes(hash).await?;
-            let map: HashMap<String, Hash> = from_slice(&serialized_map)?;
-
-            // Set the collection_hashes HashMap
-            {
-                let mut collection_hashes = blobs.collection_hashes.write().await;
-                *collection_hashes = map;
-            }
-        }
     
         Ok(blobs)
     }
@@ -142,7 +116,6 @@ impl VeilidIrohBlobs {
             store,
             tunnels,
             handles: handles.clone(),
-            collection_hashes: Arc::new(RwLock::new(HashMap::new())),
             base_dir,
         };
 
@@ -163,31 +136,6 @@ impl VeilidIrohBlobs {
     }
 
     pub async fn shutdown(self) -> Result<()> {
-        // Serialize the collection_hashes HashMap
-        let map = self.collection_hashes.read().await;
-        let serialized_map = serde_cbor::to_vec(&*map)?;
-
-        // Log: Writing serialized collection_hashes to a temporary file
-        println!("Writing serialized collection_hashes to a temporary file...");
-
-        // Write the serialized data to a temporary file
-        let temp_path = self.base_dir.join("collection_hashes.cbor");
-        std::fs::write(&temp_path, &serialized_map)?;
-
-        // Convert the path to an absolute path
-        let absolute_temp_path = std::fs::canonicalize(&temp_path)?;
-
-        // Log: Uploading the serialized data from file to the store
-        println!("Uploading the serialized data from file to the store...");
-
-        // Upload the serialized data to the store using upload_from_path
-        let collection_hashes_hash = self.upload_from_path(absolute_temp_path).await?;
-
-        // Write the hash to a file in the base directory
-        let hash_file_path = self.base_dir.join("collection_hashes_hash");
-        let hash_hex = hex::encode(collection_hashes_hash.as_bytes());
-        std::fs::write(hash_file_path, hash_hex)?;
-
         // Shutdown the handles
         let handles = self.handles.lock().unwrap();
         for handle in handles.iter() {
@@ -475,143 +423,181 @@ impl VeilidIrohBlobs {
         return Ok(read);
     }
     pub async fn create_collection(&self, collection_name: String) -> anyhow::Result<Hash> {
-        
         println!("Creating a new empty collection with name: {}", collection_name);
-        
-        // Create a new empty collection
-        let collection = Collection::default();
     
-         // Log: Serializing the collection to CBOR
-        println!("Serializing the collection to CBOR...");
+        // Create a new empty HashMap for the collection
+        let collection: HashMap<String, Hash> = HashMap::new();
     
-        // Serialize the collection to CBOR
+        // Serialize the HashMap to CBOR
         let cbor_data = to_vec(&collection)?;
-
-        // Log: Writing CBOR data to a temporary file
-        println!("Writing CBOR data to a temporary file...");
-        
-        // Create a temporary file to store the CBOR data
+    
+        // Write the CBOR data to a temporary file
         let temp_path = self.base_dir.join(format!("{}_collection.cbor", collection_name));
         std::fs::write(&temp_path, &cbor_data)?;
-        
-        // Convert the path to an absolute path
+    
+        // Convert the path to an absolute path and upload it to the store
         let absolute_temp_path = std::fs::canonicalize(&temp_path)?;
-
-        // Log: Uploading the CBOR data from file to the store
-        println!("Uploading the CBOR data from file to the store...");
-
-        // Upload the CBOR data to the store using upload_from_path
         let collection_hash = self.upload_from_path(absolute_temp_path).await?;
-
-        // Log: Storing the collection hash in the HashMap
-        println!("Storing the collection hash in the HashMap...");
-
-        // Store the collection hash in the HashMap
-        {
-            let mut map = self.collection_hashes.write().await;
-            map.insert(collection_name, collection_hash);
-        }
-
-        // Log: Collection created successfully
+    
+        // Store the new collection hash using the tag system
+        self.store.set_tag(
+            collection_name.to_string().into(),
+            Some(HashAndFormat::new(collection_hash, BlobFormat::Raw)),
+        ).await?;
+    
         println!("Collection created successfully with hash: {:?}", collection_hash);
-
         Ok(collection_hash)
     }
     
+    
+    
+    pub async fn set_file(&self, collection_name: String, path: String, file_hash: Hash) -> Result<Hash> {
+         // Retrieve the current collection hash from the tag
+        println!("Attempting to retrieve tag for collection: {}", collection_name);
 
-    pub async fn set_file(&self, collection_name: String, path: String, hash: Hash) -> Result<Hash> {
-        // Retrieve the collection's current hash
-        let collection_hash = self.collection_hash(&collection_name).await?;
-    
-        // Read the collection data from the store
-        let collection_data = self.read_bytes(collection_hash).await?;
-        let mut collection: Collection = from_slice(&collection_data)?;
-    
-        // Add or update the file in the collection
-        collection.files.insert(path, hash);
-    
-        // Serialize the updated collection to CBOR
+        // Retrieve the collection hash using `collection_hash` (use this to get the collection)
+        let collection_hash = match self.collection_hash(&collection_name).await {
+            Ok(hash) => hash,
+            Err(e) => {
+                println!("Error retrieving tag for collection: {:?}", e);
+                return Err(anyhow!("Tag retrieval failed for collection: {:?}", e));
+            }
+        };
+
+        println!("Successfully retrieved tag for collection: {}", collection_name);
+
+        // Fetch collection data by its hash
+        let collection_entry = self.store.get(&collection_hash).await?;
+        let mut collection: HashMap<String, Hash> = if let Some(entry) = collection_entry {
+            let mut reader = entry.data_reader();
+            let collection_data: Bytes = reader.read_to_end().await?;
+            match from_slice(&collection_data) {
+                Ok(deserialized_collection) => deserialized_collection,
+                Err(err) => {
+                    println!("Error deserializing collection: {:?}", err);
+                    return Err(anyhow!("Failed to deserialize collection: {:?}", err));
+                }
+            }
+        } else {
+            HashMap::new()
+        };
+
+        // Add or update the file in the collection (HashMap)
+        collection.insert(path, file_hash);
+
+        // Serialize the updated HashMap to CBOR
         let cbor_data = to_vec(&collection)?;
-        
-            
-        // Write the CBOR data to a temporary file
-        let temp_path = self.base_dir.join(format!("{}_updated.cbor", collection_name));
+
+        // Upload the updated collection data to the store
+        let temp_path = self.base_dir.join("updated_collection.cbor");
         std::fs::write(&temp_path, &cbor_data)?;
-
-        // Convert the path to an absolute path
         let absolute_temp_path = std::fs::canonicalize(&temp_path)?;
-
-        // Upload the updated collection
         let new_collection_hash = self.upload_from_path(absolute_temp_path).await?;
+
+        // Log: Print the new collection hash
+        println!("New collection hash: {:?}", new_collection_hash);
+
+        // Store the new collection hash with the tag
+        self.store_tag(&collection_name, new_collection_hash).await?;
+
         
-        // Update the collection hash in the HashMap
-        {
-            let mut map = self.collection_hashes.write().await;
-            map.insert(collection_name, new_collection_hash);
+        // Introduce a small delay to ensure the tag is properly stored and synced
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+
+        // Verify the tag immediately after storing
+        let verified_hash = self.get_tag(&collection_name).await?;
+        if verified_hash == new_collection_hash {
+            println!("Tag verified for collection: {}", collection_name);
+        } else {
+            return Err(anyhow!("Tag verification failed for collection: {}", collection_name));
         }
     
         Ok(new_collection_hash)
     }
-    
-    
     pub async fn get_file(&self, collection_name: String, path: String) -> Result<Hash> {
-        // Retrieve the collection's current hash
-        let collection_hash = self.collection_hash(&collection_name).await?;
+        // Retrieve the current collection hash from the tag
+        let collection_hash = self.get_tag(&collection_name).await?;
     
-        // Read the collection data from the store
-        let collection_data = self.read_bytes(collection_hash).await?;
-        let collection: Collection = from_slice(&collection_data)?;
+        // Use the store to retrieve the entry for the collection hash
+        let collection_entry = self.store.get(&collection_hash).await?;
     
-        // Get the file hash
-        if let Some(file_hash) = collection.files.get(&path) {
-            Ok(*file_hash)
+        // Check if the collection exists
+        if let Some(entry) = collection_entry {
+            let mut reader = entry.data_reader();
+    
+            // Read the data (which should be the serialized HashMap)
+            let collection_data: Bytes = reader.read_to_end().await?;
+            let collection: HashMap<String, Hash> = from_slice(&collection_data)?;
+    
+            // Return the file hash for the given path
+            collection.get(&path).cloned().ok_or_else(|| anyhow!("File not found"))
         } else {
-            Err(anyhow!("File not found in the collection"))
+            Err(anyhow!("Collection not found"))
         }
     }
-    pub async fn delete_file(&self, collection_name: String, path: String) -> Result<Hash> {
-        // Retrieve the collection's current hash
-        let collection_hash = self.collection_hash(&collection_name).await?;
     
-        // Read and deserialize the collection
-        let collection_data = self.read_bytes(collection_hash).await?;
-        let mut collection: Collection = from_slice(&collection_data)?;
+    
+
+    
+    pub async fn delete_file(&self, collection_name: String, path: String) -> Result<Hash> {
+        // Retrieve the current collection hash from the tag
+        let collection_tag = self.get_tag(&collection_name).await?;
+    
+        // Use the store to get the collection data by its tag
+        let collection_entry = self.store.get(&collection_tag).await?;
+        
+        // If the collection exists, read and deserialize it
+        let mut collection: HashMap<String, Hash> = if let Some(entry) = collection_entry {
+            let mut reader = entry.data_reader();
+            let collection_data: Bytes = reader.read_to_end().await?;
+            from_slice(&collection_data)?
+        } else {
+            HashMap::new()
+        };
     
         // Remove the file from the collection
-        collection.files.remove(&path);
+        collection.remove(&path);
     
-        // Serialize the updated collection to CBOR
+        // Serialize the updated HashMap to CBOR
         let cbor_data = to_vec(&collection)?;
     
-        // Write the CBOR data to a temporary file
-        let temp_path = self.base_dir.join(format!("{}_deleted.cbor", collection_name));
+        // Write the CBOR data to a temporary file and upload it to the store
+        let temp_path = self.base_dir.join("updated_collection.cbor");
         std::fs::write(&temp_path, &cbor_data)?;
-
-        // Convert the path to an absolute path
         let absolute_temp_path = std::fs::canonicalize(&temp_path)?;
-
-        // Upload the updated collection
         let new_collection_hash = self.upload_from_path(absolute_temp_path).await?;
-
-        // Update the collection hash in the HashMap
-        {
-            let mut map = self.collection_hashes.write().await;
-            map.insert(collection_name, new_collection_hash);
-        }
+    
+        // Store the new collection hash with the tag
+        self.store_tag(&collection_name, new_collection_hash).await?;
     
         Ok(new_collection_hash)
     }
+    
+    
     pub async fn list_files(&self, collection_name: String) -> Result<Vec<String>> {
-        // Retrieve the collection's current hash
-        let collection_hash = self.collection_hash(&collection_name).await?;
+        // Retrieve the current collection hash from the tag
+        let collection_hash = self.get_tag(&collection_name).await?;
     
-        // Read and deserialize the collection
-        let collection_data = self.read_bytes(collection_hash).await?;
-        let collection: Collection = from_slice(&collection_data)?;
+        // Use the store to retrieve the entry for the collection hash
+        let collection_entry = self.store.get(&collection_hash).await?;
     
-        // Return the list of file paths
-        Ok(collection.files.keys().cloned().collect())
+        // Check if the collection exists
+        if let Some(entry) = collection_entry {
+            let mut reader = entry.data_reader();
+
+        // Read the data (which should be the serialized HashMap)
+        let collection_data: Bytes = reader.read_to_end().await?;
+        let collection: HashMap<String, Hash> = from_slice(&collection_data)?;
+
+        // Return the list of file paths (the keys in the HashMap)
+        Ok(collection.keys().cloned().collect())
+        
+        } else {
+            Err(anyhow!("Collection not found"))
+        }
     }
+    
     
     pub async fn upload_to(&self, collection_name: String, path: String, file_stream: mpsc::Receiver<std::io::Result<Bytes>>) -> Result<Hash> {
         // Upload the file stream and get its hash
@@ -621,13 +607,100 @@ impl VeilidIrohBlobs {
         self.set_file(collection_name, path, file_hash).await
     }
     pub async fn collection_hash(&self, collection_name: &str) -> Result<Hash> {
-        let map = self.collection_hashes.read().await;
-        if let Some(hash) = map.get(collection_name) {
-            Ok(*hash)
-        } else {
-            Err(anyhow!("Collection {} not found", collection_name))
+        // Retrieve the tag from the store instead of using the in-memory cache
+        match self.get_tag(collection_name).await {
+            Ok(hash) => Ok(hash),
+            Err(e) => {
+                println!("Error retrieving tag for collection: {:?}", e);
+                Err(anyhow!("Collection {} not found", collection_name))
+            }
         }
     }
+    pub async fn store_tag(&self, collection_name: &str, collection_hash: Hash) -> Result<()> {
+        println!("Storing tag for collection: {} with hash: {:?}", collection_name, collection_hash);
+        
+        // Store the tag
+        self.store.set_tag(
+            collection_name.to_string().into(), 
+            Some(HashAndFormat::new(collection_hash, BlobFormat::Raw))
+        ).await?;
+    
+        // Introducing a short delay to ensure that tag is persisted
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    
+        // Verify that the tag was actually stored
+        match self.get_tag(collection_name).await {
+            Ok(stored_hash) => {
+                if stored_hash == collection_hash {
+                    println!("Tag successfully stored for collection: {}", collection_name);
+                } else {
+                    return Err(anyhow!("Mismatch in stored tag for collection: {}", collection_name));
+                }
+            },
+            Err(e) => {
+                return Err(anyhow!("Failed to retrieve tag after storing for collection: {}. Error: {:?}", collection_name, e));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    
+    
+    
+    pub async fn get_tag(&self, collection_name: &str) -> Result<Hash> {
+        println!("Retrieving tag for collection: {}", collection_name);
+        let mut tags = self.store.tags().await?;
+    
+           
+        while let Some(tag_result) = tags.next() {
+            match tag_result {
+                Ok((tag, hash_and_format)) => {
+                    // Logging for better insight
+                    println!("Checking tag: {:?}", tag);
+
+                    // Extract the bytes and convert them to a string
+                    let tag_bytes = tag.borrow();
+                    let tag_str = std::str::from_utf8(tag_bytes).unwrap_or("");
+
+                    // Compare the extracted tag string with collection_name
+                    if tag_str == collection_name {
+                        println!("Found matching tag for collection: {}", collection_name);
+                        return Ok(hash_and_format.hash);
+                    } else {
+                        println!("Tag {} does not match {}", tag_str, collection_name);
+                    }
+                }
+                Err(e) => {
+                    println!("Error reading tags: {:?}", e);
+                    return Err(anyhow!("Error reading tags: {:?}", e));
+                }
+            }
+        }
+    
+        Err(anyhow!("Tag not found for collection: {}", collection_name))
+    }
+    
+    pub async fn list_tags(&self) -> Result<()> {
+        println!("Listing all available tags...");
+        let mut tags = self.store.tags().await?;
+    
+        while let Some(tag_result) = tags.next() {
+            match tag_result {
+                Ok((tag, hash_and_format)) => {
+                    println!("Found tag: {} with hash: {:?}", tag, hash_and_format.hash);
+                }
+                Err(e) => {
+                    println!("Error reading tags: {:?}", e);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    
+    
     
 
     pub fn route_id_blob(&self) -> Vec<u8> {
@@ -801,6 +874,11 @@ async fn test_collection_operations() {
     assert!(!collection_hash.as_bytes().is_empty(), "Collection hash should not be empty");
     println!("Created collection with hash: {}", collection_hash);
 
+    // List tags to verify if the collection tag is created
+    println!("Listing tags after creating the collection...");
+    blobs.list_tags().await.unwrap(); // List all available tags
+ 
+
     // Test set_file
     let file_path = "test_file.txt".to_string();
 
@@ -856,5 +934,221 @@ async fn test_collection_operations() {
   
     // Clean up by shutting down blobs instance
     blobs.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn test_set_file() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None).await.unwrap();
+
+    // Test create_collection
+    let collection_name = "my_test_collection".to_string();
+    let collection_hash = blobs.create_collection(collection_name.clone()).await.unwrap();
+
+    assert!(!collection_hash.as_bytes().is_empty(), "Collection hash should not be empty");
+    println!("Created collection with hash: {}", collection_hash);
+
+    // Add a delay to ensure the tag is fully persisted
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Directly verify if the tag was set after collection creation
+    println!("Checking if tag exists after creation...");
+    blobs.list_tags().await.unwrap();
+    
+    // Attempt to retrieve the tag
+    println!("Attempting to retrieve tag for collection: {}", collection_name);
+    match blobs.get_tag(&collection_name).await {
+        Ok(tag_hash) => {
+            println!("Successfully retrieved tag: {:?}", tag_hash);
+        }
+        Err(e) => {
+            println!("Error retrieving tag: {:?}", e);
+        }
+    }
+
+    // Test set_file
+    let file_path = "test_file.txt".to_string();
+    let temp_file_path = base_dir.join("test_file.txt");
+    std::fs::write(&temp_file_path, "test file content").unwrap();
+    let temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
+
+    let file_hash = blobs.upload_from_path(temp_file_path).await.unwrap();
+    println!("File hash: {}", file_hash);
+
+    let has_file = blobs.has_hash(&file_hash).await;
+    println!("Has file: {}", has_file);
+    assert!(has_file, "Store should have the file hash after upload");
+
+    let updated_collection_hash = blobs.set_file(collection_name.clone(), file_path.clone(), file_hash).await.unwrap();
+    assert!(!updated_collection_hash.as_bytes().is_empty(), "Updated collection hash should not be empty");
+
+    blobs.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn test_get_file() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None).await.unwrap();
+
+    // Test create_collection
+    let collection_name = "my_test_collection".to_string();
+    blobs.create_collection(collection_name.clone()).await.unwrap();
+
+    // Test set_file
+    let file_path = "test_file.txt".to_string();
+    let temp_file_path = base_dir.join("test_file.txt");
+    std::fs::write(&temp_file_path, "test file content").unwrap();
+    let temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
+
+    let file_hash = blobs.upload_from_path(temp_file_path).await.unwrap();
+    blobs.set_file(collection_name.clone(), file_path.clone(), file_hash).await.unwrap();
+
+    // Test get_file
+    let retrieved_file_hash = blobs.get_file(collection_name.clone(), file_path.clone()).await.unwrap();
+    assert_eq!(file_hash, retrieved_file_hash, "The file hash should match the uploaded file hash");
+
+    blobs.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn test_delete_file() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None).await.unwrap();
+
+    // Test create_collection
+    let collection_name = "my_test_collection".to_string();
+    blobs.create_collection(collection_name.clone()).await.unwrap();
+
+    // Test set_file
+    let file_path = "test_file.txt".to_string();
+    let temp_file_path = base_dir.join("test_file.txt");
+    std::fs::write(&temp_file_path, "test file content").unwrap();
+    let temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
+
+    let file_hash = blobs.upload_from_path(temp_file_path).await.unwrap();
+    blobs.set_file(collection_name.clone(), file_path.clone(), file_hash).await.unwrap();
+
+    // Test delete_file
+    let new_collection_hash = blobs.delete_file(collection_name.clone(), file_path.clone()).await.unwrap();
+    assert!(!new_collection_hash.as_bytes().is_empty(), "New collection hash after deletion should not be empty");
+
+    blobs.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn test_list_files() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None).await.unwrap();
+
+    // Test create_collection
+    let collection_name = "my_test_collection".to_string();
+    blobs.create_collection(collection_name.clone()).await.unwrap();
+
+    // Test set_file
+    let file_path = "test_file.txt".to_string();
+    let temp_file_path = base_dir.join("test_file.txt");
+    std::fs::write(&temp_file_path, "test file content").unwrap();
+    let temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
+
+    let file_hash = blobs.upload_from_path(temp_file_path).await.unwrap();
+    blobs.set_file(collection_name.clone(), file_path.clone(), file_hash).await.unwrap();
+
+    // Test list_files
+    let file_list = blobs.list_files(collection_name.clone()).await.unwrap();
+    assert_eq!(file_list.len(), 1, "There should be one file in the collection");
+    assert_eq!(file_list[0], file_path, "The file path should match the uploaded file path");
+
+    blobs.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn test_collection_hash() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None).await.unwrap();
+
+    // Test create_collection
+    let collection_name = "my_test_collection".to_string();
+    let initial_collection_hash = blobs.create_collection(collection_name.clone()).await.unwrap();
+
+    // Test collection_hash
+    let retrieved_collection_hash = blobs.collection_hash(&collection_name).await.unwrap();
+    assert_eq!(initial_collection_hash, retrieved_collection_hash, "The retrieved collection hash should match the created collection hash");
+
+    blobs.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn test_upload_to() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None).await.unwrap();
+
+    // Test create_collection
+    let collection_name = "my_test_collection".to_string();
+    blobs.create_collection(collection_name.clone()).await.unwrap();
+
+    // Create a temporary file to upload
+    let file_path = "uploaded_file.txt".to_string();
+    let temp_file_path = base_dir.join("uploaded_file.txt");
+    std::fs::write(&temp_file_path, "test file content for upload_to").unwrap();
+    let absolute_temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
+
+    let file_hash = blobs.upload_from_path(absolute_temp_file_path).await.unwrap();
+
+    // Add the uploaded file to the collection
+    let new_file_collection_hash = blobs.set_file(collection_name.clone(), file_path.clone(), file_hash).await.unwrap();
+    assert!(!new_file_collection_hash.as_bytes().is_empty(), "New collection hash after uploading a file should not be empty");
+
+    blobs.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_missing_collection() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None).await.unwrap();
+
+    // Attempt to retrieve a file from a non-existent collection
+    let result = blobs.get_file("non_existent_collection".to_string(), "some_file.txt".to_string()).await;
+    assert!(result.is_err(), "Retrieving file from non-existent collection should fail");
+
+    // Attempt to list files in a non-existent collection
+    let result = blobs.list_files("non_existent_collection".to_string()).await;
+    assert!(result.is_err(), "Listing files from non-existent collection should fail");
+}
+
+#[tokio::test]
+async fn test_overwrite_file() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None).await.unwrap();
+    let collection_name = "my_test_collection".to_string();
+    blobs.create_collection(collection_name.clone()).await.unwrap();
+    
+    let file_path = "test_file.txt".to_string();
+    let temp_file_path = base_dir.join("test_file.txt");
+    std::fs::write(&temp_file_path, "test file content").unwrap();
+    let temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
+
+    let file_hash = blobs.upload_from_path(temp_file_path.clone()).await.unwrap();
+    blobs.set_file(collection_name.clone(), file_path.clone(), file_hash).await.unwrap();
+
+    // Overwrite the file with new content
+    std::fs::write(&temp_file_path, "new test file content").unwrap();
+    let new_file_hash = blobs.upload_from_path(temp_file_path).await.unwrap();
+    let updated_collection_hash = blobs.set_file(collection_name.clone(), file_path.clone(), new_file_hash).await.unwrap();
+
+    assert!(!updated_collection_hash.as_bytes().is_empty(), "Updated collection hash should not be empty");
+    
+    // Ensure that the file hash was updated
+    let retrieved_file_hash = blobs.get_file(collection_name.clone(), file_path.clone()).await.unwrap();
+    assert_eq!(new_file_hash, retrieved_file_hash, "The file hash should be updated after overwrite");
 }
 
