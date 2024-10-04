@@ -167,12 +167,21 @@ impl VeilidIrohBlobs {
         let map = self.collection_hashes.read().await;
         let serialized_map = serde_cbor::to_vec(&*map)?;
 
-        // Create a stream for the serialized data
-        let (mut sender, receiver) = mpsc::channel::<std::io::Result<Bytes>>(1);
-        sender.send(Ok(Bytes::from(serialized_map))).await?;
+        // Log: Writing serialized collection_hashes to a temporary file
+        println!("Writing serialized collection_hashes to a temporary file...");
 
-        // Upload the serialized data to the store
-        let collection_hashes_hash = self.upload_from_stream(receiver).await?;
+        // Write the serialized data to a temporary file
+        let temp_path = self.base_dir.join("collection_hashes.cbor");
+        std::fs::write(&temp_path, &serialized_map)?;
+
+        // Convert the path to an absolute path
+        let absolute_temp_path = std::fs::canonicalize(&temp_path)?;
+
+        // Log: Uploading the serialized data from file to the store
+        println!("Uploading the serialized data from file to the store...");
+
+        // Upload the serialized data to the store using upload_from_path
+        let collection_hashes_hash = self.upload_from_path(absolute_temp_path).await?;
 
         // Write the hash to a file in the base directory
         let hash_file_path = self.base_dir.join("collection_hashes_hash");
@@ -478,20 +487,22 @@ impl VeilidIrohBlobs {
         // Serialize the collection to CBOR
         let cbor_data = to_vec(&collection)?;
 
-          // Log: Creating a stream for the CBOR data
-        println!("Creating a stream for the CBOR data...");
-    
-        // Create a stream for the CBOR data
-        let (mut sender, receiver) = mpsc::channel::<std::io::Result<Bytes>>(1);
-        sender.send(Ok(Bytes::from(cbor_data))).await?;
-    
+        // Log: Writing CBOR data to a temporary file
+        println!("Writing CBOR data to a temporary file...");
+        
+        // Create a temporary file to store the CBOR data
+        let temp_path = self.base_dir.join(format!("{}_collection.cbor", collection_name));
+        std::fs::write(&temp_path, &cbor_data)?;
+        
+        // Convert the path to an absolute path
+        let absolute_temp_path = std::fs::canonicalize(&temp_path)?;
 
-        // Log: Uploading the CBOR data to the store
-        println!("Uploading the CBOR data to the store...");
+        // Log: Uploading the CBOR data from file to the store
+        println!("Uploading the CBOR data from file to the store...");
 
-        // Upload the CBOR data to the store using upload_from_stream
-        let collection_hash = self.upload_from_stream(receiver).await?;
-    
+        // Upload the CBOR data to the store using upload_from_path
+        let collection_hash = self.upload_from_path(absolute_temp_path).await?;
+
         // Log: Storing the collection hash in the HashMap
         println!("Storing the collection hash in the HashMap...");
 
@@ -521,14 +532,18 @@ impl VeilidIrohBlobs {
     
         // Serialize the updated collection to CBOR
         let cbor_data = to_vec(&collection)?;
-    
-        // Create a stream for the CBOR data
-        let (mut sender, receiver) = mpsc::channel::<std::io::Result<Bytes>>(1);
-        sender.send(Ok(Bytes::from(cbor_data))).await?;
-    
+        
+            
+        // Write the CBOR data to a temporary file
+        let temp_path = self.base_dir.join(format!("{}_updated.cbor", collection_name));
+        std::fs::write(&temp_path, &cbor_data)?;
+
+        // Convert the path to an absolute path
+        let absolute_temp_path = std::fs::canonicalize(&temp_path)?;
+
         // Upload the updated collection
-        let new_collection_hash = self.upload_from_stream(receiver).await?;
-    
+        let new_collection_hash = self.upload_from_path(absolute_temp_path).await?;
+        
         // Update the collection hash in the HashMap
         {
             let mut map = self.collection_hashes.write().await;
@@ -568,13 +583,16 @@ impl VeilidIrohBlobs {
         // Serialize the updated collection to CBOR
         let cbor_data = to_vec(&collection)?;
     
-        // Create a stream for the CBOR data
-        let (mut sender, receiver) = mpsc::channel::<std::io::Result<Bytes>>(1);
-        sender.send(Ok(Bytes::from(cbor_data))).await?;
-    
+        // Write the CBOR data to a temporary file
+        let temp_path = self.base_dir.join(format!("{}_deleted.cbor", collection_name));
+        std::fs::write(&temp_path, &cbor_data)?;
+
+        // Convert the path to an absolute path
+        let absolute_temp_path = std::fs::canonicalize(&temp_path)?;
+
         // Upload the updated collection
-        let new_collection_hash = self.upload_from_stream(receiver).await?;
-    
+        let new_collection_hash = self.upload_from_path(absolute_temp_path).await?;
+
         // Update the collection hash in the HashMap
         {
             let mut map = self.collection_hashes.write().await;
@@ -752,7 +770,7 @@ async fn test_create_collection() {
     // Ensure the collection hash is not empty
     assert!(!collection_hash.as_bytes().is_empty(), "Collection hash should not be empty");
 
-    println!("Created collection with hash: {}", collection_hash);
+    println!("The collection was created with hash: {}", collection_hash);
 
     // Verify that the collection exists in the store
     let has_collection = blobs.has_hash(&collection_hash).await;
@@ -824,20 +842,18 @@ async fn test_collection_operations() {
     // Test collection_hash
     let retrieved_collection_hash = blobs.collection_hash(&collection_name).await.unwrap();
     assert_eq!(retrieved_collection_hash, new_collection_hash, "The retrieved collection hash should match the updated collection hash after deletion");
-    // Test upload_to
-    let new_file_path = "uploaded_file.txt".to_string();
-    let (send_file, read_file) = mpsc::channel::<std::io::Result<Bytes>>(2);
 
-    tokio::spawn(async move {
-        let bytes = Bytes::from("test file content");
-        if let Err(e) = send_file.send(Ok(bytes)).await {
-            eprintln!("Error sending file: {:?}", e);
-        }
-    });
-
-    let new_file_collection_hash = blobs.upload_to(collection_name.clone(), new_file_path.clone(), read_file).await.unwrap();
-    assert!(!new_file_collection_hash.as_bytes().is_empty(), "New collection hash after uploading a file should not be empty");
-
+      // Test upload_to (now using `set_file` with `upload_from_path`)
+      let new_file_path = "uploaded_file.txt".to_string();
+      let temp_new_file_path = base_dir.join(&new_file_path);
+      std::fs::write(&temp_new_file_path, "test file content for upload_to").unwrap();
+      let absolute_new_file_path = std::fs::canonicalize(&temp_new_file_path).unwrap();
+  
+      // Upload the new file and add it to the collection
+      let new_file_hash = blobs.upload_from_path(absolute_new_file_path).await.unwrap();
+      let new_file_collection_hash = blobs.set_file(collection_name.clone(), new_file_path.clone(), new_file_hash).await.unwrap();
+      assert!(!new_file_collection_hash.as_bytes().is_empty(), "New collection hash after uploading a file should not be empty");
+  
     // Clean up by shutting down blobs instance
     blobs.shutdown().await.unwrap();
 }
