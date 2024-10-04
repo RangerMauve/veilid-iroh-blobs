@@ -731,10 +731,13 @@ async fn test_collection_operations() {
     // Test set_file
     let file_path = "test_file.txt".to_string();
 
-    
+        
     // Create a temporary file to upload
     let temp_file_path = base_dir.join("test_file.txt");
     std::fs::write(&temp_file_path, "test file content").unwrap();
+
+    // Ensure the path is absolute
+    let temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
 
     let file_hash = blobs.upload_from_path(temp_file_path).await.unwrap();
         
