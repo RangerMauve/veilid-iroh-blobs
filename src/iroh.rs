@@ -71,6 +71,7 @@ impl<'a> SimpleStore for StoreWrapper<'a> {
         hash: Hash,
     ) -> impl Future<Output = Result<Bytes, anyhow::Error>> + Send + '_ {
         Box::pin(async move {
+            println!("StoreWrapper::load called with hash: {:?}", hash);
             if let Some(blob_handle) = self.inner.get(&hash).await? {
                 let mut reader = blob_handle.data_reader();
                 let mut buffer = vec![0u8; reader.size().await? as usize];
@@ -434,23 +435,41 @@ impl VeilidIrohBlobs {
         // Return the hash of the collection
         Ok(collection_hash)
     }
-
     pub async fn set_file(&self, collection_name: String, path: String, hash: Hash) -> Result<Hash> {
+        // Debug: Print the hash before pushing
+        println!("Adding file with path: {}, hash: {:?}", path, hash);
+        println!("Collection name: {}", collection_name);
+
         // Load the collection by its hash from the store
         let collection_hash = self.collection_hash(collection_name.clone()).await?;
-
+    
+        println!("Collection hash: {:?}", collection_hash);
         let store_wrapper = StoreWrapper { inner: &self.store };
-
+    
         let mut collection = Collection::load(collection_hash, &store_wrapper).await?;
+    
+        println!("Collection entries before adding file:");
 
+        for entry in collection.iter() {
+            println!("Entry path: {}, hash: {:?}", entry.0, entry.1);
+        }
         // Add the file to the collection
-        collection.push(path, hash);
-
+        collection.push(path.clone(), hash);
+    
+        // Debug: Print collection entries after push
+        for entry in collection.iter() {
+            println!("Entry path: {}, hash: {:?}", entry.0, entry.1);
+        }
+    
         // Store the updated collection and get the new root hash
         let temp_tag = collection.store(&self.store).await?;
+
+        println!("Collection stored with new hash: {:?}", temp_tag.hash());
+
+
         let new_collection_hash = *temp_tag.hash();
         let format = temp_tag.format();
-
+    
         // Update the tag in the store
         let hash_and_format = HashAndFormat {
             hash: new_collection_hash,
@@ -458,10 +477,11 @@ impl VeilidIrohBlobs {
         };
         let tag = Tag::from(collection_name.clone());
         self.store.set_tag(tag, Some(hash_and_format)).await?;
-
+    
         // Return the new root hash of the updated collection
         Ok(new_collection_hash)
     }
+    
     
     pub async fn get_file(&self, collection_name: String, path: String) -> Result<Hash> {
         // Load the collection by its hash from the store
