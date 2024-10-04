@@ -1,6 +1,9 @@
+use crate::init_deps;
 use crate::init_veilid;
 use crate::make_route;
+use crate::tunnels::OnNewRouteCallback;
 use crate::tunnels::OnNewTunnelCallback;
+use crate::tunnels::OnRouteDisconnectedCallback;
 use crate::tunnels::Tunnel;
 use crate::tunnels::TunnelManager;
 
@@ -10,7 +13,6 @@ use anyhow::Result;
 use bytes::BufMut;
 use bytes::Bytes;
 use bytes::BytesMut;
-use futures_lite::{Stream, StreamExt};
 use iroh_blobs::store::ImportMode;
 use iroh_blobs::store::ImportProgress;
 use iroh_blobs::store::Map;
@@ -22,7 +24,6 @@ use iroh_blobs::Hash;
 use iroh_io::AsyncSliceReader;
 use std::io::ErrorKind;
 use std::path::Path;
-use std::process::Command;
 use std::result;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -54,7 +55,12 @@ pub struct VeilidIrohBlobs {
 }
 
 impl VeilidIrohBlobs {
-    pub async fn from_directory(base_dir: &PathBuf, namespace: Option<String>) -> Result<Self> {
+    pub async fn from_directory(
+        base_dir: &PathBuf,
+        namespace: Option<String>,
+        on_route_disconnected_callback: Option<OnRouteDisconnectedCallback>,
+        on_new_route_callback: Option<OnNewRouteCallback>,
+    ) -> Result<Self> {
         let (veilid, updates, store) = init_deps(namespace, base_dir).await?;
 
         let router = veilid.routing_context().unwrap();
@@ -67,6 +73,8 @@ impl VeilidIrohBlobs {
             route_id,
             updates,
             store,
+            on_route_disconnected_callback,
+            on_new_route_callback,
         ));
     }
 
@@ -77,6 +85,8 @@ impl VeilidIrohBlobs {
         route_id: RouteId,
         updates: Receiver<VeilidUpdate>,
         store: iroh_blobs::store::fs::Store,
+        on_route_disconnected_callback: Option<OnRouteDisconnectedCallback>,
+        on_new_route_callback: Option<OnNewRouteCallback>,
     ) -> Self {
         let (send_tunnel, read_tunnel) = mpsc::channel::<Tunnel>(1);
 
@@ -88,8 +98,15 @@ impl VeilidIrohBlobs {
             });
         });
 
-        let tunnels =
-            TunnelManager::new(veilid, router, route_id, route_id_blob, Some(on_new_tunnel));
+        let tunnels = TunnelManager::new(
+            veilid,
+            router,
+            route_id,
+            route_id_blob,
+            Some(on_new_tunnel),
+            on_route_disconnected_callback,
+            on_new_route_callback,
+        );
 
         let listening = tunnels.clone();
 
@@ -381,119 +398,7 @@ impl VeilidIrohBlobs {
         return Ok(read);
     }
 
-    pub fn route_id_blob(&self) -> Vec<u8> {
-        return self.tunnels.route_id_blob();
+    pub async fn route_id_blob(&self) -> Vec<u8> {
+        return self.tunnels.route_id_blob().await;
     }
-}
-
-async fn init_deps(
-    namespace: Option<String>,
-    base_dir: &PathBuf,
-) -> Result<(
-    VeilidAPI,
-    Receiver<VeilidUpdate>,
-    iroh_blobs::store::fs::Store,
-)> {
-    let store = iroh_blobs::store::fs::Store::load(base_dir.join("iroh")).await?;
-
-    let (veilid, rx) = init_veilid(namespace, base_dir).await?;
-
-    return Ok((veilid, rx, store));
-}
-
-#[tokio::test]
-async fn test_blobs() {
-    //unsafe { backtrace_on_stack_overflow::enable() }
-
-    let mut base_dir = PathBuf::new();
-    base_dir.push(".veilid");
-
-    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None)
-        .await
-        .unwrap();
-
-    let hash = blobs
-        .upload_from_path(std::fs::canonicalize(Path::new("./README.md").to_path_buf()).unwrap())
-        .await
-        .unwrap();
-
-    println!("Hash of README: {0}", hash);
-
-    let receiver = blobs.read_file(hash).await.unwrap();
-
-    let mut stream = tokio_stream::wrappers::ReceiverStream::new(receiver);
-
-    let data = stream.next().await;
-
-    println!("{:?}", data);
-
-    let has = blobs.has_hash(&hash).await;
-
-    println!("Blobs has hash: {}", has);
-
-    blobs.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn test_blob_replication() {
-    let mut base_dir = PathBuf::new();
-    base_dir.push(".veilid");
-    let (veilid, mut rx) = init_veilid(None, &base_dir).await.unwrap();
-
-    let (send_update, read_update) = broadcast::channel::<VeilidUpdate>(256);
-    let read_update1 = read_update;
-    let read_update2 = send_update.subscribe();
-
-    let sender_handle = tokio::spawn(async move {
-        while let Result::Ok(update) = rx.recv().await {
-            if let VeilidUpdate::RouteChange(change) = update {
-                println!("Route change {:?}", change);
-                continue;
-            }
-            //println!("Received update: {:#?}", update);
-            if let Err(err) = send_update.send(update) {
-                eprintln!("Unable to process veilid update: {:?}", err);
-            }
-        }
-    });
-
-    let v1 = veilid.clone();
-    let v2 = veilid.clone();
-
-    let mut store1_dir = base_dir.clone();
-    store1_dir.push("peer1");
-    let store1 = iroh_blobs::store::fs::Store::load(store1_dir)
-        .await
-        .unwrap();
-
-    let mut store2_dir = base_dir.clone();
-    store2_dir.push("peer2");
-    let store2 = iroh_blobs::store::fs::Store::load(store2_dir)
-        .await
-        .unwrap();
-    let router1 = v1.routing_context().unwrap();
-    let (route_id1, route_id1_blob) = make_route(&v1).await.unwrap();
-
-    println!("Initializing route2");
-    let router2 = v2.routing_context().unwrap();
-    let (route_id2, route_id2_blob) = make_route(&v2).await.unwrap();
-
-    let blobs1 = VeilidIrohBlobs::new(v1, router1, route_id1_blob, route_id1, read_update1, store1);
-    let blobs2 = VeilidIrohBlobs::new(v2, router2, route_id2_blob, route_id2, read_update2, store2);
-
-    let hash = blobs1
-        .upload_from_path(std::fs::canonicalize(Path::new("./README.md").to_path_buf()).unwrap())
-        .await
-        .unwrap();
-
-    blobs2
-        .download_file_from(blobs1.route_id_blob(), &hash)
-        .await
-        .unwrap();
-
-    let has = blobs2.has_hash(&hash).await;
-
-    assert!(has, "Blobs has hash after download");
-
-    sender_handle.abort();
 }

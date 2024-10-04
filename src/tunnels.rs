@@ -13,11 +13,14 @@ use tokio::sync::Mutex;
 use veilid_core::CryptoKey;
 use veilid_core::VeilidAPI;
 use veilid_core::VeilidAppMessage;
+use veilid_core::VALID_CRYPTO_KINDS;
 use veilid_core::{RouteId, RoutingContext, Target, VeilidUpdate, CRYPTO_KEY_LENGTH};
 
 pub type Tunnel = (Sender<Vec<u8>>, Receiver<Vec<u8>>);
 pub type TunnelId = (RouteId, u32);
 pub type OnNewTunnelCallback = Arc<dyn Fn(Tunnel) + Send + Sync>;
+pub type OnRouteDisconnectedCallback = Arc<dyn Fn() + Send + Sync>;
+pub type OnNewRouteCallback = Arc<dyn Fn(RouteId, Vec<u8>) + Send + Sync>;
 
 // SAVE on a phone pad
 static PING_BYTES: &'static [u8] = &[7, 2, 8, 3];
@@ -31,17 +34,18 @@ pub enum TunnelResult {
 
 struct TunnelManagerInner {
     router: RoutingContext,
+    veilid: VeilidAPI,
     route_id: RouteId,
     route_id_blob: Vec<u8>,
     id_counter: u32,
     senders: HashMap<TunnelId, Sender<Vec<u8>>>,
+    on_route_disconnected_callback: Option<OnRouteDisconnectedCallback>,
+    on_new_route_callback: Option<OnNewRouteCallback>,
 }
 
 #[derive(Clone)]
 pub struct TunnelManager {
     inner: Arc<Mutex<TunnelManagerInner>>,
-    route_id: RouteId,
-    route_id_blob: Vec<u8>,
     veilid: VeilidAPI,
     on_new_tunnel: Option<OnNewTunnelCallback>,
 }
@@ -50,25 +54,16 @@ impl TunnelManagerInner {
     async fn send_ping(&self, id: &TunnelId) -> Result<()> {
         let mut bytes = PING_BYTES.to_vec();
         bytes.extend(self.route_id_blob.clone());
-        println!("{0} Sending ping", self.route_id);
-
         return self.send_bytes(id, bytes).await;
     }
 
-    // TODO: Don't unwrap
     async fn send_bytes(&self, id: &TunnelId, bytes: Vec<u8>) -> Result<()> {
-        println!(
-            "{0} sending bytes to {1:?} {2:?}",
-            self.route_id, id.0, bytes
-        );
         let mut buffer: BytesMut = BytesMut::with_capacity(bytes.len() + 4 + CRYPTO_KEY_LENGTH);
         buffer.put(self.route_id.bytes.to_vec().as_slice());
         buffer.put_u32(id.1);
         buffer.put(bytes.as_slice());
         let target = Target::PrivateRoute(id.0);
         let result = self.router.app_message(target, buffer.to_vec()).await;
-
-        println!("{0} sent bytes {1:?}", self.route_id, buffer.to_vec());
 
         match result {
             Ok(_) => Ok(()),
@@ -103,10 +98,20 @@ impl TunnelManagerInner {
             if *route_id != self.route_id {
                 continue;
             }
+            if let Some(callback) = &self.on_route_disconnected_callback {
+                callback();
+            }
             for id in self.senders.keys() {
                 if id.0 == *route_id {
                     let _ = self.notify_bytes(id, &[]).await;
                 }
+            }
+            // TODO: Better error handling?
+            let (route_id, route_id_blob) = make_route(&self.veilid).await.unwrap();
+            self.route_id = route_id.clone();
+            self.route_id_blob = route_id_blob.clone();
+            if let Some(callback) = &self.on_new_route_callback {
+                callback(route_id, route_id_blob);
             }
         }
         self.senders.clear();
@@ -126,7 +131,7 @@ impl TunnelManager {
 
         let inner = self.inner.clone();
         let id = id.clone();
-        let route_id = self.route_id.clone();
+        let route_id = self.route_id().await;
 
         tokio::spawn(async move {
             while let Some(bytes) = from_tun_to_man.recv().await {
@@ -148,7 +153,6 @@ impl TunnelManager {
     }
 
     async fn handle_new(&self, id: &TunnelId, message: &[u8]) -> Result<()> {
-        println!("{0} handling new", self.route_id);
         let ping = &message[0..PING_BYTES.len()];
         if !ping.eq(PING_BYTES) {
             return Err(anyhow!(
@@ -171,7 +175,6 @@ impl TunnelManager {
         let tunnel = self.track(id).await?;
 
         if self.on_new_tunnel.is_some() {
-            println!("{0} calling on_new callback", self.route_id);
             self.on_new_tunnel.as_ref().unwrap()(tunnel);
         }
 
@@ -189,20 +192,22 @@ impl TunnelManager {
     }
 
     async fn handle_message(&self, id: &TunnelId, message: &[u8]) -> Result<()> {
-        println!("{0} handling incoming message {1:?}", self.route_id, id);
         if self.has_tunnel(id).await {
-            println!("{0} existing tunnel", self.route_id);
-
             // TODO: Log failed requests?
             if let Err(err) = self.send_to_tunnel(id, message).await {
                 eprintln!(
                     "{0} Unable to send data to tunnel {1:?}",
-                    self.route_id, err
+                    self.route_id().await,
+                    err
                 );
             }
         } else {
             if let Err(err) = self.handle_new(id, message).await {
-                eprintln!("{0} Unable to handle new tunnel {1:?}", self.route_id, err);
+                eprintln!(
+                    "{0} Unable to handle new tunnel {1:?}",
+                    self.route_id().await,
+                    err
+                );
             };
         }
 
@@ -212,23 +217,18 @@ impl TunnelManager {
     async fn handle_app_message(&self, app_messsage: &Box<VeilidAppMessage>) -> Result<()> {
         // No route or wrong route means it's prob from elsewhere
         if !app_messsage.route_id().is_some() {
-            println!("{0} app call without route", self.route_id);
             return Ok(());
         }
         let route_id = app_messsage.route_id().unwrap();
-        if route_id != &self.route_id {
-            println!("{0} app call for other route", self.route_id);
+        if route_id != &self.route_id().await {
             return Ok(());
         }
-
-        println!("{0} handling app call", self.route_id);
 
         let mut buffer = Bytes::copy_from_slice(app_messsage.message());
 
         // THis is all to read 32 bytes into a fixed buffer 💀
         let route_id_buffer = buffer.get(0..32);
         if route_id_buffer.is_none() {
-            println!("{0} Missing route id buffer in app call", self.route_id);
             return Ok(());
         }
         let route_id_buffer = route_id_buffer.unwrap();
@@ -262,6 +262,8 @@ impl TunnelManager {
     pub async fn from_veilid(
         veilid: VeilidAPI,
         on_new_tunnel: Option<OnNewTunnelCallback>,
+        on_route_disconnected_callback: Option<OnRouteDisconnectedCallback>,
+        on_new_route_callback: Option<OnNewRouteCallback>,
     ) -> Result<Self> {
         let router = veilid.routing_context()?;
         let (route_id, route_id_blob) = veilid.new_private_route().await?;
@@ -272,6 +274,8 @@ impl TunnelManager {
             route_id,
             route_id_blob,
             on_new_tunnel,
+            on_route_disconnected_callback,
+            on_new_route_callback,
         ));
     }
 
@@ -281,18 +285,21 @@ impl TunnelManager {
         route_id: RouteId,
         route_id_blob: Vec<u8>,
         on_new_tunnel: Option<OnNewTunnelCallback>,
+        on_route_disconnected_callback: Option<OnRouteDisconnectedCallback>,
+        on_new_route_callback: Option<OnNewRouteCallback>,
     ) -> Self {
         let inner = Arc::new(Mutex::new(TunnelManagerInner {
             route_id,
             route_id_blob: route_id_blob.clone(),
             router,
+            veilid: veilid.clone(),
             senders: HashMap::new(),
             id_counter: 0,
+            on_route_disconnected_callback,
+            on_new_route_callback,
         }));
 
         let tunnels = TunnelManager {
-            route_id,
-            route_id_blob,
             inner,
             veilid,
             on_new_tunnel,
@@ -301,12 +308,16 @@ impl TunnelManager {
         return tunnels;
     }
 
-    pub fn route_id(&self) -> RouteId {
-        return self.route_id;
+    pub async fn route_id(&self) -> RouteId {
+        let inner = self.inner.lock().await;
+
+        return inner.route_id.clone();
     }
 
-    pub fn route_id_blob(&self) -> Vec<u8> {
-        return self.route_id_blob.clone();
+    pub async fn route_id_blob(&self) -> Vec<u8> {
+        let inner = self.inner.lock().await;
+
+        return inner.route_id_blob.clone();
     }
 
     pub async fn open(&self, route_id_blob: Vec<u8>) -> Result<Tunnel> {
@@ -336,7 +347,6 @@ impl TunnelManager {
     ) -> Result<()> {
         while let Ok(update) = updates.recv().await {
             if let VeilidUpdate::AppMessage(app_message) = update {
-                println!("{0} got appcall in manager", self.route_id);
                 self.handle_app_message(&app_message).await?;
             } else if let VeilidUpdate::RouteChange(route_change) = update {
                 if route_change.dead_remote_routes.len() != 0 {
@@ -350,8 +360,6 @@ impl TunnelManager {
             //println!("{0} Got event in manager");
         }
 
-        println!("{0} FInished listening to updates", self.route_id);
-
         return Ok(());
     }
 
@@ -360,4 +368,24 @@ impl TunnelManager {
         self.veilid.shutdown().await;
         return Ok(());
     }
+}
+
+// TODO: Put these into a utils module or something
+async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
+    let mut retries = 3;
+    while retries != 0 {
+        retries -= 1;
+        let result = veilid
+            .new_custom_private_route(
+                &VALID_CRYPTO_KINDS,
+                veilid_core::Stability::Reliable,
+                veilid_core::Sequencing::EnsureOrdered,
+            )
+            .await;
+
+        if result.is_ok() {
+            return Ok(result.unwrap());
+        }
+    }
+    return Err(anyhow!("Unable to create route, reached max retries"));
 }
