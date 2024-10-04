@@ -16,7 +16,6 @@ use iroh_blobs::store::ImportProgress;
 use iroh_blobs::store::Map;
 use iroh_blobs::store::ReadableStore;
 use iroh_blobs::store::Store;
-use iroh_blobs::format::collection::{Collection, SimpleStore};
 use iroh_blobs::util::progress::IgnoreProgressSender;
 use iroh_blobs::HashAndFormat;
 use iroh_blobs::BlobFormat;
@@ -24,7 +23,6 @@ use iroh_blobs::Hash;
 use iroh_blobs::Tag;
 use std::pin::Pin;
 use std::collections::HashMap;
-
 use iroh_io::AsyncSliceReader;
 use std::io::ErrorKind;
 use std::io::Error;
@@ -38,11 +36,15 @@ use std::{path::PathBuf, sync::Arc};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::mpsc;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 use veilid_core::{RouteId, RoutingContext, VeilidAPI, VeilidUpdate};
+use serde::{Serialize, Deserialize};
+use serde_cbor::{to_vec, from_slice};
+use hex;
 
 const NO: u8 = 0x00u8;
 const YES: u8 = 0x01u8;
@@ -54,34 +56,18 @@ const ERR: u8 = 0xF0u8;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(4000);
 
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct Collection {
+    files: HashMap<String, Hash>,
+}
+
 #[derive(Clone)]
 pub struct VeilidIrohBlobs {
     tunnels: TunnelManager,
     store: iroh_blobs::store::fs::Store,
     handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
-}
-
-struct StoreWrapper<'a> {
-    inner: &'a iroh_blobs::store::fs::Store,
-}
-
-impl<'a> SimpleStore for StoreWrapper<'a> {
-    fn load(
-        &self,
-        hash: Hash,
-    ) -> impl Future<Output = Result<Bytes, anyhow::Error>> + Send + '_ {
-        Box::pin(async move {
-            println!("StoreWrapper::load called with hash: {:?}", hash);
-            if let Some(blob_handle) = self.inner.get(&hash).await? {
-                let mut reader = blob_handle.data_reader();
-                let mut buffer = vec![0u8; reader.size().await? as usize];
-                reader.read_at(0, buffer.len()).await?;
-                Ok(Bytes::from(buffer))
-            } else {
-                Err(anyhow::anyhow!("Blob not found for hash: {:?}", hash))
-            }
-        })
-    }
+    collection_hashes: Arc<RwLock<HashMap<String, Hash>>>,
+    base_dir: PathBuf,
 }
 
 impl VeilidIrohBlobs {
@@ -91,14 +77,39 @@ impl VeilidIrohBlobs {
         let router = veilid.routing_context().unwrap();
         let (route_id, route_id_blob) = make_route(&veilid).await.unwrap();
 
-        return Ok(Self::new(
+        let blobs = Self::new(
             veilid,
             router,
             route_id_blob,
             route_id,
             updates,
             store,
-        ));
+            base_dir.clone(), // Pass base_dir
+        );
+    
+        // Load the collection_hashes HashMap
+        let hash_file_path = base_dir.join("collection_hashes_hash");
+        if hash_file_path.exists() {
+            let hash_str = std::fs::read_to_string(hash_file_path)?;
+            let hash_bytes = hex::decode(hash_str.trim())?;
+            if hash_bytes.len() != 32 {
+                return Err(anyhow!("Invalid hash length: expected 32 bytes, got {}", hash_bytes.len()));
+            }
+            let hash_array: [u8; 32] = hash_bytes.as_slice().try_into().unwrap();
+            let hash = Hash::from_bytes(hash_array);
+
+            // Retrieve the serialized HashMap from the store
+            let serialized_map = blobs.read_bytes(hash).await?;
+            let map: HashMap<String, Hash> = from_slice(&serialized_map)?;
+
+            // Set the collection_hashes HashMap
+            {
+                let mut collection_hashes = blobs.collection_hashes.write().await;
+                *collection_hashes = map;
+            }
+        }
+    
+        Ok(blobs)
     }
 
     pub fn new(
@@ -108,6 +119,7 @@ impl VeilidIrohBlobs {
         route_id: RouteId,
         updates: Receiver<VeilidUpdate>,
         store: iroh_blobs::store::fs::Store,
+        base_dir: PathBuf, 
     ) -> Self {
         let (send_tunnel, read_tunnel) = mpsc::channel::<Tunnel>(1);
 
@@ -130,6 +142,8 @@ impl VeilidIrohBlobs {
             store,
             tunnels,
             handles: handles.clone(),
+            collection_hashes: Arc::new(RwLock::new(HashMap::new())),
+            base_dir,
         };
 
         let listening_blobs = blobs.clone();
@@ -149,12 +163,30 @@ impl VeilidIrohBlobs {
     }
 
     pub async fn shutdown(self) -> Result<()> {
+        // Serialize the collection_hashes HashMap
+        let map = self.collection_hashes.read().await;
+        let serialized_map = serde_cbor::to_vec(&*map)?;
+
+        // Create a stream for the serialized data
+        let (mut sender, receiver) = mpsc::channel::<std::io::Result<Bytes>>(1);
+        sender.send(Ok(Bytes::from(serialized_map))).await?;
+
+        // Upload the serialized data to the store
+        let collection_hashes_hash = self.upload_from_stream(receiver).await?;
+
+        // Write the hash to a file in the base directory
+        let hash_file_path = self.base_dir.join("collection_hashes_hash");
+        let hash_hex = hex::encode(collection_hashes_hash.as_bytes());
+        std::fs::write(hash_file_path, hash_hex)?;
+
+        // Shutdown the handles
         let handles = self.handles.lock().unwrap();
-        handles[0].abort();
-        handles[1].abort();
+        for handle in handles.iter() {
+            handle.abort();
+        }
         self.tunnels.shutdown().await?;
         self.store.shutdown().await;
-        return Ok(());
+        Ok(())
     }
     async fn listen(&self, mut on_new_tunnel: mpsc::Receiver<Tunnel>) -> Result<()> {
         while let Some(tunnel) = on_new_tunnel.recv().await {
@@ -371,17 +403,39 @@ impl VeilidIrohBlobs {
         &self,
         receiver: mpsc::Receiver<std::io::Result<Bytes>>,
     ) -> Result<Hash> {
+        // Log: Starting upload from stream
+        println!("Starting upload from stream...");
+
         let stream = ReceiverStream::new(receiver);
         let progress = IgnoreProgressSender::<ImportProgress>::default();
+        
+        // Log: Importing stream to store
+        println!("Importing stream to store...");
+        
         let (tag, _) = self
             .store
             .import_stream(stream, BlobFormat::Raw, progress)
             .await?;
 
+                
+        // Log: Stream imported successfully
+        println!("Stream imported successfully, generating hash...");
+
         let hash = tag.hash().clone();
+
+        // Log: Upload completed with hash
+        println!("Upload completed successfully with hash: {:?}", hash);
+
         return Ok(hash);
     }
-
+    async fn read_bytes(&self, hash: Hash) -> Result<Vec<u8>> {
+        let mut receiver = self.read_file(hash).await?;
+        let mut data = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            data.extend_from_slice(&chunk?);
+        }
+        Ok(data)
+    }
     pub async fn read_file(&self, hash: Hash) -> Result<mpsc::Receiver<std::io::Result<Bytes>>> {
         let handle = self.store.get(&hash).await?;
 
@@ -412,179 +466,151 @@ impl VeilidIrohBlobs {
         return Ok(read);
     }
     pub async fn create_collection(&self, collection_name: String) -> anyhow::Result<Hash> {
+        
+        println!("Creating a new empty collection with name: {}", collection_name);
+        
         // Create a new empty collection
         let collection = Collection::default();
+    
+         // Log: Serializing the collection to CBOR
+        println!("Serializing the collection to CBOR...");
+    
+        // Serialize the collection to CBOR
+        let cbor_data = to_vec(&collection)?;
 
-        // Store the collection in the store and get its hash and format
-        let temp_tag = collection.store(&self.store).await?;
-        let collection_hash = *temp_tag.hash();
-        let format = temp_tag.format();
+          // Log: Creating a stream for the CBOR data
+        println!("Creating a stream for the CBOR data...");
+    
+        // Create a stream for the CBOR data
+        let (mut sender, receiver) = mpsc::channel::<std::io::Result<Bytes>>(1);
+        sender.send(Ok(Bytes::from(cbor_data))).await?;
+    
 
-        // Create a HashAndFormat
-        let hash_and_format = HashAndFormat {
-            hash: collection_hash,
-            format,
-        };
+        // Log: Uploading the CBOR data to the store
+        println!("Uploading the CBOR data to the store...");
 
-        // Create a Tag from the collection name
-        let tag = Tag::from(collection_name.clone());
+        // Upload the CBOR data to the store using upload_from_stream
+        let collection_hash = self.upload_from_stream(receiver).await?;
+    
+        // Log: Storing the collection hash in the HashMap
+        println!("Storing the collection hash in the HashMap...");
 
-        // Set the tag in the store
-        self.store.set_tag(tag, Some(hash_and_format)).await?;
+        // Store the collection hash in the HashMap
+        {
+            let mut map = self.collection_hashes.write().await;
+            map.insert(collection_name, collection_hash);
+        }
 
-        // Return the hash of the collection
+        // Log: Collection created successfully
+        println!("Collection created successfully with hash: {:?}", collection_hash);
+
         Ok(collection_hash)
     }
+    
+
     pub async fn set_file(&self, collection_name: String, path: String, hash: Hash) -> Result<Hash> {
-        // Debug: Print the hash before pushing
-        println!("Adding file with path: {}, hash: {:?}", path, hash);
-        println!("Collection name: {}", collection_name);
-
-        // Load the collection by its hash from the store
-        let collection_hash = self.collection_hash(collection_name.clone()).await?;
+        // Retrieve the collection's current hash
+        let collection_hash = self.collection_hash(&collection_name).await?;
     
-        println!("Collection hash: {:?}", collection_hash);
-        let store_wrapper = StoreWrapper { inner: &self.store };
+        // Read the collection data from the store
+        let collection_data = self.read_bytes(collection_hash).await?;
+        let mut collection: Collection = from_slice(&collection_data)?;
     
-        let mut collection = Collection::load(collection_hash, &store_wrapper).await?;
+        // Add or update the file in the collection
+        collection.files.insert(path, hash);
     
-        println!("Collection entries before adding file:");
-
-        for entry in collection.iter() {
-            println!("Entry path: {}, hash: {:?}", entry.0, entry.1);
+        // Serialize the updated collection to CBOR
+        let cbor_data = to_vec(&collection)?;
+    
+        // Create a stream for the CBOR data
+        let (mut sender, receiver) = mpsc::channel::<std::io::Result<Bytes>>(1);
+        sender.send(Ok(Bytes::from(cbor_data))).await?;
+    
+        // Upload the updated collection
+        let new_collection_hash = self.upload_from_stream(receiver).await?;
+    
+        // Update the collection hash in the HashMap
+        {
+            let mut map = self.collection_hashes.write().await;
+            map.insert(collection_name, new_collection_hash);
         }
-        // Add the file to the collection
-        collection.push(path.clone(), hash);
     
-        // Debug: Print collection entries after push
-        for entry in collection.iter() {
-            println!("Entry path: {}, hash: {:?}", entry.0, entry.1);
-        }
-    
-        // Store the updated collection and get the new root hash
-        let temp_tag = collection.store(&self.store).await?;
-
-        println!("Collection stored with new hash: {:?}", temp_tag.hash());
-
-
-        let new_collection_hash = *temp_tag.hash();
-        let format = temp_tag.format();
-    
-        // Update the tag in the store
-        let hash_and_format = HashAndFormat {
-            hash: new_collection_hash,
-            format,
-        };
-        let tag = Tag::from(collection_name.clone());
-        self.store.set_tag(tag, Some(hash_and_format)).await?;
-    
-        // Return the new root hash of the updated collection
         Ok(new_collection_hash)
     }
     
     
     pub async fn get_file(&self, collection_name: String, path: String) -> Result<Hash> {
-        // Load the collection by its hash from the store
-        let collection_hash = self.collection_hash(collection_name.clone()).await?;
-
-        let store_wrapper = StoreWrapper { inner: &self.store };
-
-        let collection = Collection::load(collection_hash, &store_wrapper).await?;
+        // Retrieve the collection's current hash
+        let collection_hash = self.collection_hash(&collection_name).await?;
     
-        // Find the file by its path in the collection
-        for (file_path, file_hash) in collection.iter() {
-            if file_path == &path {
-                return Ok(*file_hash);
-            }
+        // Read the collection data from the store
+        let collection_data = self.read_bytes(collection_hash).await?;
+        let collection: Collection = from_slice(&collection_data)?;
+    
+        // Get the file hash
+        if let Some(file_hash) = collection.files.get(&path) {
+            Ok(*file_hash)
+        } else {
+            Err(anyhow!("File not found in the collection"))
         }
-    
-        Err(anyhow!("File not found in the collection"))
     }
-
     pub async fn delete_file(&self, collection_name: String, path: String) -> Result<Hash> {
-        // Load the collection by its hash from the store
-        let collection_hash = self.collection_hash(collection_name.clone()).await?;
-
-        let store_wrapper = StoreWrapper { inner: &self.store };
-
-        let collection = Collection::load(collection_hash, &store_wrapper).await?;
-
+        // Retrieve the collection's current hash
+        let collection_hash = self.collection_hash(&collection_name).await?;
+    
+        // Read and deserialize the collection
+        let collection_data = self.read_bytes(collection_hash).await?;
+        let mut collection: Collection = from_slice(&collection_data)?;
+    
         // Remove the file from the collection
-        let new_entries = collection.iter()
-            .filter(|(file_path, _)| file_path != &path)
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let mut new_collection = Collection::default();
-        for (file_path, file_hash) in new_entries {
-            new_collection.push(file_path, file_hash);
+        collection.files.remove(&path);
+    
+        // Serialize the updated collection to CBOR
+        let cbor_data = to_vec(&collection)?;
+    
+        // Create a stream for the CBOR data
+        let (mut sender, receiver) = mpsc::channel::<std::io::Result<Bytes>>(1);
+        sender.send(Ok(Bytes::from(cbor_data))).await?;
+    
+        // Upload the updated collection
+        let new_collection_hash = self.upload_from_stream(receiver).await?;
+    
+        // Update the collection hash in the HashMap
+        {
+            let mut map = self.collection_hashes.write().await;
+            map.insert(collection_name, new_collection_hash);
         }
-
-        // Store the updated collection and get the new root hash
-        let temp_tag = new_collection.store(&self.store).await?;
-        let new_collection_hash = *temp_tag.hash();
-        let format = temp_tag.format();
-
-        // Update the tag in the store
-        let hash_and_format = HashAndFormat {
-            hash: new_collection_hash,
-            format,
-        };
-        let tag = Tag::from(collection_name.clone());
-        self.store.set_tag(tag, Some(hash_and_format)).await?;
-
-        // Return the new root hash of the updated collection
+    
         Ok(new_collection_hash)
     }
-    
     pub async fn list_files(&self, collection_name: String) -> Result<Vec<String>> {
-        // Load the collection by its hash from the store
-        let collection_hash = self.collection_hash(collection_name.clone()).await?;
-
-        let store_wrapper = StoreWrapper { inner: &self.store };
-
-        let collection = Collection::load(collection_hash, &store_wrapper).await?;
+        // Retrieve the collection's current hash
+        let collection_hash = self.collection_hash(&collection_name).await?;
     
-        // Collect all file paths
-        let file_paths: Vec<String> = collection.iter().map(|(file_path, _)| file_path.clone()).collect();
+        // Read and deserialize the collection
+        let collection_data = self.read_bytes(collection_hash).await?;
+        let collection: Collection = from_slice(&collection_data)?;
     
-        Ok(file_paths)
+        // Return the list of file paths
+        Ok(collection.files.keys().cloned().collect())
     }
-
+    
     pub async fn upload_to(&self, collection_name: String, path: String, file_stream: mpsc::Receiver<std::io::Result<Bytes>>) -> Result<Hash> {
         // Upload the file stream and get its hash
         let file_hash = self.upload_from_stream(file_stream).await?;
-    
+
         // Add the uploaded file to the collection
         self.set_file(collection_name, path, file_hash).await
     }
-    
-    pub async fn collection_hash(&self, collection_name: String) -> Result<Hash> {
-        // Create a Tag from the collection name
-        let tag = Tag::from(collection_name.clone());
-
-        // Retrieve the HashAndFormat associated with the tag
-        if let Some(hash_and_format) = self.get_tag(&tag).await? {
-            // Return the hash
-            Ok(hash_and_format.hash)
+    pub async fn collection_hash(&self, collection_name: &str) -> Result<Hash> {
+        let map = self.collection_hashes.read().await;
+        if let Some(hash) = map.get(collection_name) {
+            Ok(*hash)
         } else {
             Err(anyhow!("Collection {} not found", collection_name))
         }
     }
-
-    async fn get_tag(&self, target_tag: &Tag) -> Result<Option<HashAndFormat>> {
-        // Retrieve an iterator over all tags
-        let mut tags_iter = self.store.tags().await?;
     
-        // Iterate over the tags to find the matching tag
-        while let Some(result) = tags_iter.next() {
-            let (tag, hash_and_format) = result?;
-            if &tag == target_tag {
-                return Ok(Some(hash_and_format));
-            }
-        }
-        Ok(None)
-    }
 
     pub fn route_id_blob(&self) -> Vec<u8> {
         return self.tunnels.route_id_blob();
@@ -667,13 +693,13 @@ async fn test_blob_replication() {
 
     let mut store1_dir = base_dir.clone();
     store1_dir.push("peer1");
-    let store1 = iroh_blobs::store::fs::Store::load(store1_dir)
+    let store1 = iroh_blobs::store::fs::Store::load(store1_dir.clone())
         .await
         .unwrap();
 
     let mut store2_dir = base_dir.clone();
     store2_dir.push("peer2");
-    let store2 = iroh_blobs::store::fs::Store::load(store2_dir)
+    let store2 = iroh_blobs::store::fs::Store::load(store2_dir.clone())
         .await
         .unwrap();
     let router1 = v1.routing_context().unwrap();
@@ -683,8 +709,8 @@ async fn test_blob_replication() {
     let router2 = v2.routing_context().unwrap();
     let (route_id2, route_id2_blob) = make_route(&v2).await.unwrap();
 
-    let blobs1 = VeilidIrohBlobs::new(v1, router1, route_id1_blob, route_id1, read_update1, store1);
-    let blobs2 = VeilidIrohBlobs::new(v2, router2, route_id2_blob, route_id2, read_update2, store2);
+    let blobs1 = VeilidIrohBlobs::new(v1, router1, route_id1_blob, route_id1, read_update1, store1, store1_dir.clone(),);
+    let blobs2 = VeilidIrohBlobs::new(v2, router2, route_id2_blob, route_id2, read_update2, store2, store2_dir.clone(),);
 
     let hash = blobs1
         .upload_from_path(std::fs::canonicalize(Path::new("./README.md").to_path_buf()).unwrap())
@@ -707,10 +733,17 @@ async fn test_create_collection() {
     let mut base_dir = PathBuf::new();
     base_dir.push(".veilid");
 
+    // Log: Initializing blobs instance
+    println!("Initializing blobs instance from directory: {:?}", base_dir);
+
+
     // Initialize the blobs instance
     let blobs = VeilidIrohBlobs::from_directory(&base_dir, None)
         .await
         .unwrap();
+
+    // Log: Creating collection
+    println!("Creating collection...");
 
     // Call create_collection method
     let collection_name = "my_test_collection".to_string();
@@ -731,7 +764,6 @@ async fn test_create_collection() {
     // Clean up by shutting down blobs instance
     blobs.shutdown().await.unwrap();
 }
-
 #[tokio::test]
 async fn test_collection_operations() {
     let mut base_dir = PathBuf::new();
@@ -742,6 +774,9 @@ async fn test_collection_operations() {
         .await
         .unwrap();
 
+    // Log: Creating collection
+    println!("Creating collection...");
+
     // Test create_collection
     let collection_name = "my_test_collection".to_string();
     let collection_hash = blobs.create_collection(collection_name.clone()).await.unwrap();
@@ -751,7 +786,6 @@ async fn test_collection_operations() {
     // Test set_file
     let file_path = "test_file.txt".to_string();
 
-        
     // Create a temporary file to upload
     let temp_file_path = base_dir.join("test_file.txt");
     std::fs::write(&temp_file_path, "test file content").unwrap();
@@ -760,18 +794,14 @@ async fn test_collection_operations() {
     let temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
 
     let file_hash = blobs.upload_from_path(temp_file_path).await.unwrap();
-        
+
     // Add debug statements
     println!("File hash: {}", file_hash);
-    
+
     let has_file = blobs.has_hash(&file_hash).await;
     println!("Has file: {}", has_file);
     assert!(has_file, "Store should have the file hash after upload");
-    
-    // Before loading the collection in set_file
-    println!("Collection hash in set_file: {}", collection_hash);
-    
-    
+
     let updated_collection_hash = blobs.set_file(collection_name.clone(), file_path.clone(), file_hash).await.unwrap();
     assert!(!updated_collection_hash.as_bytes().is_empty(), "Updated collection hash should not be empty");
 
@@ -792,21 +822,16 @@ async fn test_collection_operations() {
     assert!(file_list_after_deletion.is_empty(), "There should be no files in the collection after deletion");
 
     // Test collection_hash
-    let retrieved_collection_hash = blobs.collection_hash(collection_name.clone()).await.unwrap();
+    let retrieved_collection_hash = blobs.collection_hash(&collection_name).await.unwrap();
     assert_eq!(retrieved_collection_hash, new_collection_hash, "The retrieved collection hash should match the updated collection hash after deletion");
-
     // Test upload_to
     let new_file_path = "uploaded_file.txt".to_string();
     let (send_file, read_file) = mpsc::channel::<std::io::Result<Bytes>>(2);
 
     tokio::spawn(async move {
         let bytes = Bytes::from("test file content");
-        if let Err(e) = send_file.send(std::io::Result::Ok(bytes)).await {
-            // Convert the error into a `std::io::Error` and print it
-            eprintln!(
-                "Error sending file: {:?}",
-                std::io::Error::new(std::io::ErrorKind::Other, e)
-            );
+        if let Err(e) = send_file.send(Ok(bytes)).await {
+            eprintln!("Error sending file: {:?}", e);
         }
     });
 
