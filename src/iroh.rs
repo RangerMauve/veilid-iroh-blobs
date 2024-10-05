@@ -1,6 +1,9 @@
+use crate::init_deps;
 use crate::init_veilid;
 use crate::make_route;
+use crate::tunnels::OnNewRouteCallback;
 use crate::tunnels::OnNewTunnelCallback;
+use crate::tunnels::OnRouteDisconnectedCallback;
 use crate::tunnels::Tunnel;
 use crate::tunnels::TunnelManager;
 
@@ -10,7 +13,6 @@ use anyhow::Result;
 use bytes::BufMut;
 use bytes::Bytes;
 use bytes::BytesMut;
-use futures_lite::{Stream, StreamExt};
 use iroh_blobs::store::ImportMode;
 use iroh_blobs::store::ImportProgress;
 use iroh_blobs::store::Map;
@@ -28,7 +30,7 @@ use iroh_io::AsyncSliceReader;
 use std::io::ErrorKind;
 use std::io::Error;
 use std::path::Path;
-use std::process::Command;
+use std::result;
 use std::sync::Mutex;
 use std::result;
 use std::time::Duration;
@@ -67,7 +69,12 @@ pub struct VeilidIrohBlobs {
 }
 
 impl VeilidIrohBlobs {
-    pub async fn from_directory(base_dir: &PathBuf, namespace: Option<String>) -> Result<Self> {
+    pub async fn from_directory(
+        base_dir: &PathBuf,
+        namespace: Option<String>,
+        on_route_disconnected_callback: Option<OnRouteDisconnectedCallback>,
+        on_new_route_callback: Option<OnNewRouteCallback>,
+    ) -> Result<Self> {
         let (veilid, updates, store) = init_deps(namespace, base_dir).await?;
 
         let router = veilid.routing_context().unwrap();
@@ -80,10 +87,9 @@ impl VeilidIrohBlobs {
             route_id,
             updates,
             store,
-            base_dir.clone(), 
-        );
-    
-        Ok(blobs)
+            on_route_disconnected_callback,
+            on_new_route_callback,
+        ));
     }
 
     pub fn new(
@@ -93,7 +99,8 @@ impl VeilidIrohBlobs {
         route_id: RouteId,
         updates: Receiver<VeilidUpdate>,
         store: iroh_blobs::store::fs::Store,
-        base_dir: PathBuf, 
+        on_route_disconnected_callback: Option<OnRouteDisconnectedCallback>,
+        on_new_route_callback: Option<OnNewRouteCallback>,
     ) -> Self {
         let (send_tunnel, read_tunnel) = mpsc::channel::<Tunnel>(1);
 
@@ -105,8 +112,15 @@ impl VeilidIrohBlobs {
             });
         });
 
-        let tunnels =
-            TunnelManager::new(veilid, router, route_id, route_id_blob, Some(on_new_tunnel));
+        let tunnels = TunnelManager::new(
+            veilid,
+            router,
+            route_id,
+            route_id_blob,
+            Some(on_new_tunnel),
+            on_route_disconnected_callback,
+            on_new_route_callback,
+        );
 
         let listening = tunnels.clone();
 
@@ -647,8 +661,8 @@ impl VeilidIrohBlobs {
     }
     
 
-    pub fn route_id_blob(&self) -> Vec<u8> {
-        return self.tunnels.route_id_blob();
+    pub async fn route_id_blob(&self) -> Vec<u8> {
+        return self.tunnels.route_id_blob().await;
     }
 }
 
@@ -1094,4 +1108,3 @@ async fn test_overwrite_file() {
     let retrieved_file_hash = blobs.get_file(&collection_name.clone(), &file_path.clone()).await.unwrap();
     assert_eq!(new_file_hash, retrieved_file_hash, "The file hash should be updated after overwrite");
 }
-
