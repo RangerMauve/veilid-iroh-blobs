@@ -661,26 +661,6 @@ impl VeilidIrohBlobs {
     
         Err(anyhow!("Tag not found for collection: {}", collection_name))
     }
-    
-    
-    pub async fn list_tags(&self) -> Result<()> {
-        println!("Listing all available tags...");
-        let mut tags = self.store.tags().await?;
-    
-        while let Some(tag_result) = tags.next() {
-            match tag_result {
-                Ok((tag, hash_and_format)) => {
-                    println!("Found tag: {} with hash: {:?}", tag, hash_and_format.hash);
-                }
-                Err(e) => {
-                    println!("Error reading tags: {:?}", e);
-                }
-            }
-        }
-        
-        Ok(())
-    }
-    
 
     pub fn route_id_blob(&self) -> Vec<u8> {
         return self.tunnels.route_id_blob();
@@ -853,11 +833,6 @@ async fn test_collection_operations() {
     assert!(!collection_hash.as_bytes().is_empty(), "Collection hash should not be empty");
     println!("Created collection with hash: {}", collection_hash);
 
-    // List tags to verify if the collection tag is created
-    println!("Listing tags after creating the collection...");
-    blobs.list_tags().await.unwrap(); // List all available tags
- 
-
     // Test set_file
     let file_path = "test_file.txt".to_string();
 
@@ -927,9 +902,6 @@ async fn test_set_file() {
 
     assert!(!collection_hash.as_bytes().is_empty(), "Collection hash should not be empty");
     println!("Created collection with hash: {}", collection_hash);
-    // Directly verify if the tag was set after collection creation
-    println!("Checking if tag exists after creation...");
-    blobs.list_tags().await.unwrap();
     
     // Attempt to retrieve the tag
     println!("Attempting to retrieve tag for collection: {}", collection_name);
