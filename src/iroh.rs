@@ -632,29 +632,24 @@ impl VeilidIrohBlobs {
     }
     
     
-    
-    
     pub async fn get_tag(&self, collection_name: &str) -> Result<Hash> {
         println!("Retrieving tag for collection: {}", collection_name);
         let mut tags = self.store.tags().await?;
     
-           
+        let collection_name_bytes = collection_name.as_bytes();
+        
         while let Some(tag_result) = tags.next() {
             match tag_result {
                 Ok((tag, hash_and_format)) => {
                     // Logging for better insight
                     println!("Checking tag: {:?}", tag);
-
-                    // Extract the bytes and convert them to a string
-                    let tag_bytes = tag.borrow();
-                    let tag_str = std::str::from_utf8(tag_bytes).unwrap_or("");
-
-                    // Compare the extracted tag string with collection_name
-                    if tag_str == collection_name {
+    
+                      // Directly compare tag bytes with collection_name bytes
+                if tag.0.as_ref().eq(collection_name_bytes) {
                         println!("Found matching tag for collection: {}", collection_name);
                         return Ok(hash_and_format.hash);
                     } else {
-                        println!("Tag {} does not match {}", tag_str, collection_name);
+                        println!("Tag {:?} did not match {:?}", &tag, collection_name_bytes);
                     }
                 }
                 Err(e) => {
@@ -666,6 +661,7 @@ impl VeilidIrohBlobs {
     
         Err(anyhow!("Tag not found for collection: {}", collection_name))
     }
+    
     
     pub async fn list_tags(&self) -> Result<()> {
         println!("Listing all available tags...");
