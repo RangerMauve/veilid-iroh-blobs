@@ -631,36 +631,33 @@ impl VeilidIrohBlobs {
         Ok(())
     }
     
-    
     pub async fn get_tag(&self, collection_name: &str) -> Result<Hash> {
         println!("Retrieving tag for collection: {}", collection_name);
         let mut tags = self.store.tags().await?;
     
         let collection_name_bytes = collection_name.as_bytes();
-        
-        while let Some(tag_result) = tags.next() {
-            match tag_result {
-                Ok((tag, hash_and_format)) => {
-                    // Logging for better insight
-                    println!("Checking tag: {:?}", tag);
     
-                      // Directly compare tag bytes with collection_name bytes
-                if tag.0.as_ref().eq(collection_name_bytes) {
-                        println!("Found matching tag for collection: {}", collection_name);
-                        return Ok(hash_and_format.hash);
-                    } else {
-                        println!("Tag {:?} did not match {:?}", &tag, collection_name_bytes);
-                    }
-                }
-                Err(e) => {
-                    println!("Error reading tags: {:?}", e);
-                    return Err(anyhow!("Error reading tags: {:?}", e));
-                }
+        while let Some(tag_result) = tags.next() {
+            let (tag, hash_and_format) = tag_result.map_err(|e| {
+                println!("Error reading tags: {:?}", e);
+                anyhow!("Error reading tags: {:?}", e)
+            })?;
+    
+            // Logging for better insight
+            println!("Checking tag: {:?}", tag);
+    
+            // Directly compare tag bytes with collection_name bytes
+            if tag.0.as_ref().eq(collection_name_bytes) {
+                println!("Found matching tag for collection: {}", collection_name);
+                return Ok(hash_and_format.hash);
+            } else {
+                println!("Tag {:?} did not match {:?}", &tag, collection_name_bytes);
             }
         }
     
         Err(anyhow!("Tag not found for collection: {}", collection_name))
     }
+    
 
     pub fn route_id_blob(&self) -> Vec<u8> {
         return self.tunnels.route_id_blob();
