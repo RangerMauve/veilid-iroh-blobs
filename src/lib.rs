@@ -1,5 +1,6 @@
 use anyhow::anyhow;
 use anyhow::Result;
+use bytes::Bytes;
 use core::str;
 use futures_lite::{Stream, StreamExt};
 use iroh::VeilidIrohBlobs;
@@ -15,8 +16,7 @@ use tunnels::OnNewRouteCallback;
 use tunnels::OnNewTunnelCallback;
 use tunnels::OnRouteDisconnectedCallback;
 use veilid_core::{
-    RouteId, RoutingContext, UpdateCallback, VeilidAPI, VeilidConfigInner, VeilidUpdate,
-    VALID_CRYPTO_KINDS,
+    RouteId, UpdateCallback, VeilidAPI, VeilidConfigInner, VeilidUpdate, VALID_CRYPTO_KINDS,
 };
 
 pub mod iroh;
@@ -404,6 +404,513 @@ async fn test_blob_replication() {
     assert!(has, "Blobs has hash after download");
 
     sender_handle.abort();
+}
+
+#[tokio::test]
+async fn test_create_collection() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    // Log: Initializing blobs instance
+    println!("Initializing blobs instance from directory: {:?}", base_dir);
+
+    // Initialize the blobs instance
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        .await
+        .unwrap();
+
+    // Log: Creating collection
+    println!("Creating collection...");
+
+    // Call create_collection method
+    let collection_name = "my_test_collection".to_string();
+    let collection_hash = blobs
+        .create_collection(&collection_name.clone())
+        .await
+        .unwrap();
+
+    // Ensure the collection hash is not empty
+    assert!(
+        !collection_hash.as_bytes().is_empty(),
+        "Collection hash should not be empty"
+    );
+
+    println!("The collection was created with hash: {}", collection_hash);
+
+    // Verify that the collection exists in the store
+    let has_collection = blobs.has_hash(&collection_hash).await;
+    assert!(
+        has_collection,
+        "Blobs should have the collection hash after creation"
+    );
+
+    // Clean up by shutting down blobs instance
+    blobs.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn test_collection_operations() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    // Initialize the blobs instance
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        .await
+        .unwrap();
+
+    // Log: Creating collection
+    println!("Creating collection...");
+
+    // Test create_collection
+    let collection_name = "my_test_collection".to_string();
+    let collection_hash = blobs
+        .create_collection(&collection_name.clone())
+        .await
+        .unwrap();
+    assert!(
+        !collection_hash.as_bytes().is_empty(),
+        "Collection hash should not be empty"
+    );
+    println!("Created collection with hash: {}", collection_hash);
+
+    // Test set_file
+    let file_path = "test_file.txt".to_string();
+
+    // Create a temporary file to upload
+    let temp_file_path = base_dir.join("test_file.txt");
+    std::fs::write(&temp_file_path, "test file content").unwrap();
+
+    // Ensure the path is absolute
+    let temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
+
+    let file_hash = blobs.upload_from_path(temp_file_path).await.unwrap();
+
+    // Add debug statements
+    println!("File hash: {}", file_hash);
+
+    let has_file = blobs.has_hash(&file_hash).await;
+    println!("Has file: {}", has_file);
+    assert!(has_file, "Store should have the file hash after upload");
+
+    let updated_collection_hash = blobs
+        .set_file(&collection_name.clone(), &file_path.clone(), &file_hash)
+        .await
+        .unwrap();
+    assert!(
+        !updated_collection_hash.as_bytes().is_empty(),
+        "Updated collection hash should not be empty"
+    );
+
+    // Test get_file
+    let retrieved_file_hash = blobs
+        .get_file(&collection_name.clone(), &file_path.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        file_hash, retrieved_file_hash,
+        "The file hash should match the uploaded file hash"
+    );
+
+    // Test list_files
+    let file_list = blobs.list_files(&collection_name.clone()).await.unwrap();
+    assert_eq!(
+        file_list.len(),
+        1,
+        "There should be one file in the collection"
+    );
+    assert_eq!(
+        file_list[0], file_path,
+        "The file path should match the uploaded file path"
+    );
+
+    // Test delete_file
+    let new_collection_hash = blobs
+        .delete_file(&collection_name.clone(), &file_path.clone())
+        .await
+        .unwrap();
+    assert!(
+        !new_collection_hash.as_bytes().is_empty(),
+        "New collection hash after deletion should not be empty"
+    );
+
+    let file_list_after_deletion = blobs.list_files(&collection_name.clone()).await.unwrap();
+    assert!(
+        file_list_after_deletion.is_empty(),
+        "There should be no files in the collection after deletion"
+    );
+
+    // Test collection_hash
+    let retrieved_collection_hash = blobs.collection_hash(&collection_name).await.unwrap();
+    assert_eq!(
+        retrieved_collection_hash, new_collection_hash,
+        "The retrieved collection hash should match the updated collection hash after deletion"
+    );
+
+    // Test upload_to (now using `set_file` with `upload_from_path`)
+    let new_file_path = "uploaded_file.txt".to_string();
+    let temp_new_file_path = base_dir.join(&new_file_path);
+    std::fs::write(&temp_new_file_path, "test file content for upload_to").unwrap();
+    let absolute_new_file_path = std::fs::canonicalize(&temp_new_file_path).unwrap();
+
+    // Upload the new file and add it to the collection
+    let new_file_hash = blobs
+        .upload_from_path(absolute_new_file_path)
+        .await
+        .unwrap();
+    let new_file_collection_hash = blobs
+        .set_file(
+            &collection_name.clone(),
+            &new_file_path.clone(),
+            &new_file_hash,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !new_file_collection_hash.as_bytes().is_empty(),
+        "New collection hash after uploading a file should not be empty"
+    );
+
+    // Clean up by shutting down blobs instance
+    blobs.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn test_set_file() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        .await
+        .unwrap();
+
+    // Test create_collection
+    let collection_name = "my_test_collection".to_string();
+    let collection_hash = blobs
+        .create_collection(&collection_name.clone())
+        .await
+        .unwrap();
+
+    assert!(
+        !collection_hash.as_bytes().is_empty(),
+        "Collection hash should not be empty"
+    );
+    println!("Created collection with hash: {}", collection_hash);
+
+    // Attempt to retrieve the tag
+    println!(
+        "Attempting to retrieve tag for collection: {}",
+        collection_name
+    );
+    match blobs.get_tag(&collection_name).await {
+        Ok(tag_hash) => {
+            println!("Successfully retrieved tag: {:?}", tag_hash);
+        }
+        Err(e) => {
+            println!("Error retrieving tag: {:?}", e);
+        }
+    }
+
+    // Test set_file
+    let file_path = "test_file.txt".to_string();
+    let temp_file_path = base_dir.join("test_file.txt");
+    std::fs::write(&temp_file_path, "test file content").unwrap();
+    let temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
+
+    let file_hash = blobs.upload_from_path(temp_file_path).await.unwrap();
+    println!("File hash: {}", file_hash);
+
+    let has_file = blobs.has_hash(&file_hash).await;
+    println!("Has file: {}", has_file);
+    assert!(has_file, "Store should have the file hash after upload");
+
+    let updated_collection_hash = blobs
+        .set_file(&collection_name.clone(), &file_path.clone(), &file_hash)
+        .await
+        .unwrap();
+    assert!(
+        !updated_collection_hash.as_bytes().is_empty(),
+        "Updated collection hash should not be empty"
+    );
+
+    blobs.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn test_get_file() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        .await
+        .unwrap();
+
+    // Test create_collection
+    let collection_name = "my_test_collection".to_string();
+    blobs
+        .create_collection(&collection_name.clone())
+        .await
+        .unwrap();
+
+    // Test set_file
+    let file_path = "test_file.txt".to_string();
+    let temp_file_path = base_dir.join("test_file.txt");
+    std::fs::write(&temp_file_path, "test file content").unwrap();
+    let temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
+
+    let file_hash = blobs.upload_from_path(temp_file_path).await.unwrap();
+    blobs
+        .set_file(&collection_name.clone(), &file_path.clone(), &file_hash)
+        .await
+        .unwrap();
+
+    // Test get_file
+    let retrieved_file_hash = blobs
+        .get_file(&collection_name.clone(), &file_path.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        file_hash, retrieved_file_hash,
+        "The file hash should match the uploaded file hash"
+    );
+
+    blobs.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn test_delete_file() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        .await
+        .unwrap();
+
+    // Test create_collection
+    let collection_name = "my_test_collection".to_string();
+    blobs
+        .create_collection(&collection_name.clone())
+        .await
+        .unwrap();
+
+    // Test set_file
+    let file_path = "test_file.txt".to_string();
+    let temp_file_path = base_dir.join("test_file.txt");
+    std::fs::write(&temp_file_path, "test file content").unwrap();
+    let temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
+
+    let file_hash = blobs.upload_from_path(temp_file_path).await.unwrap();
+    blobs
+        .set_file(&collection_name.clone(), &file_path.clone(), &file_hash)
+        .await
+        .unwrap();
+
+    // Test delete_file
+    let new_collection_hash = blobs
+        .delete_file(&collection_name.clone(), &file_path.clone())
+        .await
+        .unwrap();
+    assert!(
+        !new_collection_hash.as_bytes().is_empty(),
+        "New collection hash after deletion should not be empty"
+    );
+
+    blobs.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn test_list_files() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        .await
+        .unwrap();
+
+    // Test create_collection
+    let collection_name = "my_test_collection".to_string();
+    blobs
+        .create_collection(&collection_name.clone())
+        .await
+        .unwrap();
+
+    // Test set_file
+    let file_path = "test_file.txt".to_string();
+    let temp_file_path = base_dir.join("test_file.txt");
+    std::fs::write(&temp_file_path, "test file content").unwrap();
+    let temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
+
+    let file_hash = blobs.upload_from_path(temp_file_path).await.unwrap();
+    blobs
+        .set_file(&collection_name.clone(), &file_path.clone(), &file_hash)
+        .await
+        .unwrap();
+
+    // Test list_files
+    let file_list = blobs.list_files(&collection_name.clone()).await.unwrap();
+    assert_eq!(
+        file_list.len(),
+        1,
+        "There should be one file in the collection"
+    );
+    assert_eq!(
+        file_list[0], file_path,
+        "The file path should match the uploaded file path"
+    );
+
+    blobs.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn test_collection_hash() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        .await
+        .unwrap();
+
+    // Test create_collection
+    let collection_name = "my_test_collection".to_string();
+    let initial_collection_hash = blobs
+        .create_collection(&collection_name.clone())
+        .await
+        .unwrap();
+
+    // Test collection_hash
+    let retrieved_collection_hash = blobs.collection_hash(&collection_name).await.unwrap();
+    assert_eq!(
+        initial_collection_hash, retrieved_collection_hash,
+        "The retrieved collection hash should match the created collection hash"
+    );
+
+    blobs.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn test_upload_to() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        .await
+        .unwrap();
+
+    // Test create_collection
+    let collection_name = "my_test_collection".to_string();
+    blobs
+        .create_collection(&collection_name.clone())
+        .await
+        .unwrap();
+
+    // Create a temporary file to upload
+    let file_path = "uploaded_file.txt".to_string();
+    let temp_file_path = base_dir.join("uploaded_file.txt");
+    std::fs::write(&temp_file_path, "test file content for upload_to").unwrap();
+    let absolute_temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
+
+    // Create a file stream using mpsc
+    let (sender, receiver) = mpsc::channel(1);
+    let file_content = Bytes::from("this is a test file content");
+
+    // Spawn a task to send the file content via the sender
+    tokio::spawn(async move {
+        sender.send(Ok(file_content)).await.unwrap();
+    });
+
+    // Call upload_to with the file stream and path
+    let file_path = "test_file.txt".to_string();
+    let file_hash = blobs
+        .upload_to(&collection_name, &file_path, receiver)
+        .await
+        .unwrap();
+
+    // Add the uploaded file to the collection
+    let new_file_collection_hash = blobs
+        .set_file(&collection_name.clone(), &file_path.clone(), &file_hash)
+        .await
+        .unwrap();
+    assert!(
+        !new_file_collection_hash.as_bytes().is_empty(),
+        "New collection hash after uploading a file should not be empty"
+    );
+
+    blobs.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_missing_collection() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        .await
+        .unwrap();
+
+    // Attempt to retrieve a file from a non-existent collection
+    let result = blobs
+        .get_file(
+            &"non_existent_collection".to_string(),
+            &"some_file.txt".to_string(),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "Retrieving file from non-existent collection should fail"
+    );
+
+    // Attempt to list files in a non-existent collection
+    let result = blobs
+        .list_files(&"non_existent_collection".to_string())
+        .await;
+    assert!(
+        result.is_err(),
+        "Listing files from non-existent collection should fail"
+    );
+}
+
+#[tokio::test]
+async fn test_overwrite_file() {
+    let mut base_dir = PathBuf::new();
+    base_dir.push(".veilid");
+
+    let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        .await
+        .unwrap();
+    let collection_name = "my_test_collection".to_string();
+    blobs
+        .create_collection(&collection_name.clone())
+        .await
+        .unwrap();
+
+    let file_path = "test_file.txt".to_string();
+    let temp_file_path = base_dir.join("test_file.txt");
+    std::fs::write(&temp_file_path, "test file content").unwrap();
+    let temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
+
+    let file_hash = blobs
+        .upload_from_path(temp_file_path.clone())
+        .await
+        .unwrap();
+    blobs
+        .set_file(&collection_name.clone(), &file_path.clone(), &file_hash)
+        .await
+        .unwrap();
+
+    // Overwrite the file with new content
+    std::fs::write(&temp_file_path, "new test file content").unwrap();
+    let new_file_hash = blobs.upload_from_path(temp_file_path).await.unwrap();
+    let updated_collection_hash = blobs
+        .set_file(&collection_name.clone(), &file_path.clone(), &new_file_hash)
+        .await
+        .unwrap();
+
+    assert!(
+        !updated_collection_hash.as_bytes().is_empty(),
+        "Updated collection hash should not be empty"
+    );
+
+    // Ensure that the file hash was updated
+    let retrieved_file_hash = blobs
+        .get_file(&collection_name.clone(), &file_path.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        new_file_hash, retrieved_file_hash,
+        "The file hash should be updated after overwrite"
+    );
 }
 
 async fn init_veilid(
