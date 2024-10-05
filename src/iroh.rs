@@ -499,20 +499,6 @@ impl VeilidIrohBlobs {
 
         // Store the new collection hash with the tag
         self.store_tag(&collection_name, &new_collection_hash).await?;
-
-        
-        // Introduce a small delay to ensure the tag is properly stored and synced
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-
-        // Verify the tag immediately after storing
-        let verified_hash = self.get_tag(&collection_name).await?;
-        if verified_hash == new_collection_hash {
-            println!("Tag verified for collection: {}", collection_name);
-        } else {
-            return Err(anyhow!("Tag verification failed for collection: {}", collection_name));
-        }
-    
         Ok(new_collection_hash)
     }
     pub async fn get_file(&self, collection_name: &String, path: &String) -> Result<Hash> {
@@ -945,10 +931,6 @@ async fn test_set_file() {
 
     assert!(!collection_hash.as_bytes().is_empty(), "Collection hash should not be empty");
     println!("Created collection with hash: {}", collection_hash);
-
-    // Add a delay to ensure the tag is fully persisted
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
     // Directly verify if the tag was set after collection creation
     println!("Checking if tag exists after creation...");
     blobs.list_tags().await.unwrap();
