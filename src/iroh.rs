@@ -455,32 +455,22 @@ impl VeilidIrohBlobs {
          // Retrieve the current collection hash from the tag
         println!("Attempting to retrieve tag for collection: {}", collection_name);
 
-        // Retrieve the collection hash using `collection_hash` (use this to get the collection)
-        let collection_hash = match self.collection_hash(&collection_name).await {
-            Ok(hash) => hash,
-            Err(e) => {
-                println!("Error retrieving tag for collection: {:?}", e);
-                return Err(anyhow!("Tag retrieval failed for collection: {:?}", e));
-            }
-        };
-
-        println!("Successfully retrieved tag for collection: {}", collection_name);
+        let collection_hash = self.collection_hash(&collection_name).await?;
 
         // Fetch collection data by its hash
-        let collection_entry = self.store.get(&collection_hash).await?;
-        let mut collection: HashMap<String, Hash> = if let Some(entry) = collection_entry {
-            let mut reader = entry.data_reader();
-            let collection_data: Bytes = reader.read_to_end().await?;
-            match from_slice(&collection_data) {
-                Ok(deserialized_collection) => deserialized_collection,
-                Err(err) => {
-                    println!("Error deserializing collection: {:?}", err);
-                    return Err(anyhow!("Failed to deserialize collection: {:?}", err));
-                }
-            }
-        } else {
-            HashMap::new()
-        };
+        let entry = self
+            .store
+            .get(&collection_hash)
+            .await?
+            .ok_or_else(|| anyhow!("Collection not found for hash: {}", collection_hash))?;
+
+        let mut reader = entry.data_reader();
+        let collection_data: Bytes = reader.read_to_end().await?;
+
+        let mut collection: HashMap<String, Hash> = from_slice(&collection_data).map_err(|err| {
+            println!("Error deserializing collection: {:?}", err);
+            anyhow!("Failed to deserialize collection: {:?}", err)
+        })?;
 
         // Add or update the file in the collection (HashMap)
         collection.insert(path.clone(), file_hash.clone());
