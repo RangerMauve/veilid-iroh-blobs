@@ -5,13 +5,11 @@ use core::str;
 use futures_lite::{Stream, StreamExt};
 use iroh::VeilidIrohBlobs;
 use std::path::Path;
-use std::result;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
-use tracing::info;
 use tunnels::OnNewRouteCallback;
 use tunnels::OnNewTunnelCallback;
 use tunnels::OnRouteDisconnectedCallback;
@@ -96,7 +94,7 @@ async fn test_tunnel() {
 
             let raw = result.unwrap();
 
-            let message = str::from_utf8(&raw.as_slice()).unwrap();
+            let message = str::from_utf8(raw.as_slice()).unwrap();
 
             if message.eq("Hello World!") {
                 send_result1.send(Ok(())).await.unwrap();
@@ -110,7 +108,7 @@ async fn test_tunnel() {
             let result = sender.send("Goodbye World!".as_bytes().to_vec()).await;
 
             send_result1
-                .send(if let Ok(_) = result {
+                .send(if result.is_ok() {
                     Ok(())
                 } else {
                     Err(anyhow!(
@@ -168,7 +166,7 @@ async fn test_tunnel() {
         let result = sender.send("Hello World!".as_bytes().to_vec()).await;
 
         send_result2
-            .send(if let Ok(_) = result {
+            .send(if result.is_ok() {
                 Ok(())
             } else {
                 Err(anyhow!(
@@ -191,7 +189,7 @@ async fn test_tunnel() {
 
         let raw = result.unwrap();
 
-        let message = str::from_utf8(&raw.as_slice()).unwrap();
+        let message = str::from_utf8(raw.as_slice()).unwrap();
 
         if message.eq("Goodbye World!") {
             send_result2.send(Ok(())).await.unwrap();
@@ -303,7 +301,7 @@ async fn test_blobs() {
         .unwrap();
 
     let hash = blobs
-        .upload_from_path(std::fs::canonicalize(Path::new("./README.md").to_path_buf()).unwrap())
+        .upload_from_path(std::fs::canonicalize(Path::new("./README.md")).unwrap())
         .await
         .unwrap();
 
@@ -390,7 +388,7 @@ async fn test_blob_replication() {
     );
 
     let hash = blobs1
-        .upload_from_path(std::fs::canonicalize(Path::new("./README.md").to_path_buf()).unwrap())
+        .upload_from_path(std::fs::canonicalize(Path::new("./README.md")).unwrap())
         .await
         .unwrap();
 
@@ -924,10 +922,9 @@ async fn init_veilid(
     let update_callback: UpdateCallback = Arc::new(move |update| {
         let tx = tx.clone();
         tokio::spawn(async move {
-            if let Err(_) = tx.send(update) {
+            if tx.send(update).is_err() {
                 // TODO:
                 println!("receiver dropped");
-                return;
             }
         });
     });
@@ -952,7 +949,7 @@ async fn init_veilid(
 
     println!("Network ready");
 
-    return Ok((veilid, rx));
+    Ok((veilid, rx))
 }
 
 async fn init_deps(
@@ -967,7 +964,7 @@ async fn init_deps(
 
     let (veilid, rx) = init_veilid(namespace, base_dir).await?;
 
-    return Ok((veilid, rx, store));
+    Ok((veilid, rx, store))
 }
 
 // TODO: Put these into a utils module or something
@@ -983,11 +980,11 @@ async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
             )
             .await;
 
-        if result.is_ok() {
-            return Ok(result.unwrap());
+        if let Ok(route) = result {
+            return Ok(route);
         }
     }
-    return Err(anyhow!("Unable to create route, reached max retries"));
+    Err(anyhow!("Unable to create route, reached max retries"))
 }
 
 fn config_for_dir(base_dir: PathBuf, namespace: Option<String>) -> VeilidConfigInner {

@@ -22,7 +22,6 @@ use iroh_blobs::BlobFormat;
 use iroh_blobs::Hash;
 use iroh_blobs::HashAndFormat;
 use iroh_io::AsyncSliceReader;
-use iroh_io::AsyncSliceReaderExt;
 use serde_cbor::{from_slice, to_vec};
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -35,6 +34,8 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use veilid_core::{RouteId, RoutingContext, VeilidAPI, VeilidUpdate};
+
+pub type FileCollection = HashMap<String, Hash>;
 
 const NO: u8 = 0x00u8;
 const YES: u8 = 0x01u8;
@@ -131,7 +132,7 @@ impl VeilidIrohBlobs {
         handles.push(tunnels_handle);
         handles.push(blobs_handle);
 
-        return blobs;
+        blobs
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -151,7 +152,7 @@ impl VeilidIrohBlobs {
                 self_clone.handle_tunnel(tunnel).await;
             });
         }
-        return Ok(());
+        Ok(())
     }
 
     async fn handle_tunnel(&self, tunnel: Tunnel) {
@@ -159,7 +160,7 @@ impl VeilidIrohBlobs {
 
         let read_result = timeout(DEFAULT_TIMEOUT, read.recv()).await;
 
-        if !read_result.is_ok() {
+        if read_result.is_err() {
             // Tunnel likely closed
             // TODO: log error?
             return;
@@ -188,7 +189,7 @@ impl VeilidIrohBlobs {
                         while let Result::Ok(read_result) =
                             timeout(DEFAULT_TIMEOUT, file.recv()).await
                         {
-                            if !read_result.is_some() {
+                            if read_result.is_none() {
                                 break;
                             }
                             let chunk = read_result.unwrap();
@@ -219,9 +220,9 @@ impl VeilidIrohBlobs {
 
     pub async fn has_hash(&self, hash: &Hash) -> bool {
         if let std::io::Result::Ok(entry) = self.store.get(hash).await {
-            return entry.is_some();
+            entry.is_some()
         } else {
-            return false;
+            false
         }
     }
 
@@ -256,7 +257,7 @@ impl VeilidIrohBlobs {
             }
         }
 
-        return Err(anyhow!("Unable to ask peer"));
+        Err(anyhow!("Unable to ask peer"))
     }
 
     pub async fn download_file_from(&self, route_id_blob: Vec<u8>, hash: &Hash) -> Result<()> {
@@ -292,7 +293,7 @@ impl VeilidIrohBlobs {
                             }
                             let message = read_result.unwrap();
 
-                            if message.len() < 1 {
+                            if message.is_empty() {
                                 let _ = send_file
                                     .send(std::io::Result::Err(std::io::Error::new(
                                         ErrorKind::InvalidData,
@@ -317,7 +318,7 @@ impl VeilidIrohBlobs {
                                 return;
                             }
                             let bytes = Bytes::from_iter(message[1..].to_vec());
-                            if let Err(_) = send_file.send(std::io::Result::Ok(bytes)).await {
+                            if send_file.send(std::io::Result::Ok(bytes)).await.is_err() {
                                 return;
                             }
                         }
@@ -337,7 +338,7 @@ impl VeilidIrohBlobs {
                 }
             }
         }
-        return Err(anyhow!("Unable to ask peer"));
+        Err(anyhow!("Unable to ask peer"))
     }
 
     pub async fn upload_from_path(&self, file: PathBuf) -> Result<Hash> {
@@ -348,7 +349,7 @@ impl VeilidIrohBlobs {
             .await?;
 
         let hash = tag.hash();
-        return Ok(*hash);
+        Ok(*hash)
     }
 
     pub async fn upload_from_stream(
@@ -364,9 +365,9 @@ impl VeilidIrohBlobs {
             .import_stream(stream, BlobFormat::Raw, progress)
             .await?;
 
-        let hash = tag.hash().clone();
+        let hash = *tag.hash();
 
-        return Ok(hash);
+        Ok(hash)
     }
 
     async fn read_bytes(&self, hash: Hash) -> Result<Vec<u8>> {
@@ -381,7 +382,7 @@ impl VeilidIrohBlobs {
     pub async fn read_file(&self, hash: Hash) -> Result<mpsc::Receiver<std::io::Result<Bytes>>> {
         let handle = self.store.get(&hash).await?;
 
-        if !handle.is_some() {
+        if handle.is_none() {
             return Err(anyhow!("Unable to find hash"));
         }
 
@@ -405,24 +406,22 @@ impl VeilidIrohBlobs {
             }
         });
 
-        return Ok(read);
+        Ok(read)
     }
 
-    pub async fn create_collection(&self, collection_name: &String) -> anyhow::Result<Hash> {
+    pub async fn create_collection(&self, collection_name: &str) -> anyhow::Result<Hash> {
         // Create a new empty HashMap for the collection
-        let collection: HashMap<String, Hash> = HashMap::new();
+        let collection: FileCollection = HashMap::new();
 
         // Create collection with collection_name and collection HashMap
-        let collection_hash = self
-            .update_collection(&collection_name, &collection)
-            .await?;
+        let collection_hash = self.update_collection(collection_name, &collection).await?;
         Ok(collection_hash)
     }
 
-    async fn get_collection(&self, collection_name: &String) -> Result<HashMap<String, Hash>> {
-        let collection_hash = self.collection_hash(&collection_name).await?;
+    async fn get_collection(&self, collection_name: &str) -> Result<FileCollection> {
+        let collection_hash = self.collection_hash(collection_name).await?;
         let collection_data = self.read_bytes(collection_hash).await?;
-        let collection: HashMap<String, Hash> = from_slice(&collection_data)
+        let collection: FileCollection = from_slice(&collection_data)
             .map_err(|err| anyhow!("Failed to deserialize collection: {:?}", err))?;
 
         Ok(collection)
@@ -430,23 +429,21 @@ impl VeilidIrohBlobs {
 
     pub async fn set_file(
         &self,
-        collection_name: &String,
-        path: &String,
+        collection_name: &str,
+        path: &str,
         file_hash: &Hash,
     ) -> Result<Hash> {
         let mut collection = self.get_collection(collection_name).await?;
 
         // Add or update the file in the collection (HashMap)
-        collection.insert(path.clone(), file_hash.clone());
+        collection.insert(path.to_string().clone(), *file_hash);
 
         // Update collection with collection_name and collection HashMap
-        let new_collection_hash = self
-            .update_collection(&collection_name, &collection)
-            .await?;
+        let new_collection_hash = self.update_collection(collection_name, &collection).await?;
 
         Ok(new_collection_hash)
     }
-    pub async fn get_file(&self, collection_name: &String, path: &String) -> Result<Hash> {
+    pub async fn get_file(&self, collection_name: &str, path: &str) -> Result<Hash> {
         let collection = self.get_collection(collection_name).await?;
 
         // Return the file hash for the given path
@@ -456,21 +453,19 @@ impl VeilidIrohBlobs {
             .ok_or_else(|| anyhow!("File not found"))
     }
 
-    pub async fn delete_file(&self, collection_name: &String, path: &String) -> Result<Hash> {
+    pub async fn delete_file(&self, collection_name: &str, path: &str) -> Result<Hash> {
         let mut collection = self.get_collection(collection_name).await?;
 
         // Remove the file from the collection
         collection.remove(path);
 
         // Update collection with collection_name and updated collection HashMap
-        let new_collection_hash = self
-            .update_collection(&collection_name, &collection)
-            .await?;
+        let new_collection_hash = self.update_collection(collection_name, &collection).await?;
 
         Ok(new_collection_hash)
     }
 
-    pub async fn list_files(&self, collection_name: &String) -> Result<Vec<String>> {
+    pub async fn list_files(&self, collection_name: &str) -> Result<Vec<String>> {
         let collection = self.get_collection(collection_name).await?;
         // Return the list of file paths (the keys in the HashMap)
         Ok(collection.keys().cloned().collect())
@@ -478,15 +473,15 @@ impl VeilidIrohBlobs {
 
     pub async fn upload_to(
         &self,
-        collection_name: &String,
-        path: &String,
+        collection_name: &str,
+        path: &str,
         file_stream: mpsc::Receiver<std::io::Result<Bytes>>,
     ) -> Result<Hash> {
         // Upload the file stream and get its hash
         let file_hash = self.upload_from_stream(file_stream).await?;
 
         // Add the uploaded file to the collection
-        self.set_file(&collection_name, &path, &file_hash).await
+        self.set_file(collection_name, path, &file_hash).await
     }
 
     pub async fn collection_hash(&self, collection_name: &str) -> Result<Hash> {
@@ -507,11 +502,11 @@ impl VeilidIrohBlobs {
     }
 
     pub async fn get_tag(&self, collection_name: &str) -> Result<Hash> {
-        let mut tags = self.store.tags().await?;
+        let tags = self.store.tags().await?;
 
         let collection_name_bytes = collection_name.as_bytes();
 
-        while let Some(tag_result) = tags.next() {
+        for tag_result in tags {
             let (tag, hash_and_format) =
                 tag_result.map_err(|e| anyhow!("Error reading tags: {:?}", e))?;
 
@@ -526,8 +521,8 @@ impl VeilidIrohBlobs {
 
     pub async fn update_collection(
         &self,
-        collection_name: &String,
-        collection: &HashMap<String, Hash>,
+        collection_name: &str,
+        collection: &FileCollection,
     ) -> Result<Hash> {
         // Serialize the updated HashMap to CBOR
         let cbor_data = to_vec(&collection)?;
@@ -554,6 +549,6 @@ impl VeilidIrohBlobs {
     }
 
     pub async fn route_id_blob(&self) -> Vec<u8> {
-        return self.tunnels.route_id_blob().await;
+        self.tunnels.route_id_blob().await
     }
 }

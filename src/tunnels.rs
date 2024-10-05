@@ -23,7 +23,7 @@ pub type OnRouteDisconnectedCallback = Arc<dyn Fn() + Send + Sync>;
 pub type OnNewRouteCallback = Arc<dyn Fn(RouteId, Vec<u8>) + Send + Sync>;
 
 // SAVE on a phone pad
-static PING_BYTES: &'static [u8] = &[7, 2, 8, 3];
+static PING_BYTES: &[u8] = &[7, 2, 8, 3];
 
 #[repr(u8)]
 pub enum TunnelResult {
@@ -54,7 +54,7 @@ impl TunnelManagerInner {
     async fn send_ping(&self, id: &TunnelId) -> Result<()> {
         let mut bytes = PING_BYTES.to_vec();
         bytes.extend(self.route_id_blob.clone());
-        return self.send_bytes(id, bytes).await;
+        self.send_bytes(id, bytes).await
     }
 
     async fn send_bytes(&self, id: &TunnelId, bytes: Vec<u8>) -> Result<()> {
@@ -73,15 +73,15 @@ impl TunnelManagerInner {
 
     async fn notify_bytes(&self, id: &TunnelId, bytes: &[u8]) -> Result<()> {
         let sender = self.senders.get(id);
-        if !sender.is_some() {
+        if sender.is_none() {
             return Err(anyhow!("Unknown tunnel id"));
         }
 
-        return sender
+        sender
             .unwrap()
             .send(bytes.to_vec())
             .await
-            .map_err(|err| anyhow!("Unable to send: {}", err));
+            .map_err(|err| anyhow!("Unable to send: {}", err))
     }
 
     async fn handle_remote_dead(&mut self, routes: &[CryptoKey]) {
@@ -108,7 +108,7 @@ impl TunnelManagerInner {
             }
             // TODO: Better error handling?
             let (route_id, route_id_blob) = make_route(&self.veilid).await.unwrap();
-            self.route_id = route_id.clone();
+            self.route_id = route_id;
             self.route_id_blob = route_id_blob.clone();
             if let Some(callback) = &self.on_new_route_callback {
                 callback(route_id, route_id_blob);
@@ -130,12 +130,12 @@ impl TunnelManager {
         }
 
         let inner = self.inner.clone();
-        let id = id.clone();
+        let id = *id;
         let route_id = self.route_id().await;
 
         tokio::spawn(async move {
             while let Some(bytes) = from_tun_to_man.recv().await {
-                if bytes.len() == 0 {
+                if bytes.is_empty() {
                     // Signal that the tunnel is closed
                     break;
                 }
@@ -149,7 +149,7 @@ impl TunnelManager {
             }
         });
 
-        return Ok((tun_to_man, from_man_to_tun));
+        Ok((tun_to_man, from_man_to_tun))
     }
 
     async fn handle_new(&self, id: &TunnelId, message: &[u8]) -> Result<()> {
@@ -178,17 +178,17 @@ impl TunnelManager {
             self.on_new_tunnel.as_ref().unwrap()(tunnel);
         }
 
-        return Ok(());
+        Ok(())
     }
 
     async fn send_to_tunnel(&self, id: &TunnelId, bytes: &[u8]) -> Result<()> {
         let inner = self.inner.lock().await;
-        return inner.notify_bytes(id, bytes).await;
+        inner.notify_bytes(id, bytes).await
     }
 
     async fn has_tunnel(&self, id: &TunnelId) -> bool {
         let inner = self.inner.lock().await;
-        return inner.senders.contains_key(id);
+        inner.senders.contains_key(id)
     }
 
     async fn handle_message(&self, id: &TunnelId, message: &[u8]) -> Result<()> {
@@ -201,22 +201,20 @@ impl TunnelManager {
                     err
                 );
             }
-        } else {
-            if let Err(err) = self.handle_new(id, message).await {
-                eprintln!(
-                    "{0} Unable to handle new tunnel {1:?}",
-                    self.route_id().await,
-                    err
-                );
-            };
+        } else if let Err(err) = self.handle_new(id, message).await {
+            eprintln!(
+                "{0} Unable to handle new tunnel {1:?}",
+                self.route_id().await,
+                err
+            );
         }
 
-        return Ok(());
+        Ok(())
     }
 
     async fn handle_app_message(&self, app_messsage: &Box<VeilidAppMessage>) -> Result<()> {
         // No route or wrong route means it's prob from elsewhere
-        if !app_messsage.route_id().is_some() {
+        if app_messsage.route_id().is_none() {
             return Ok(());
         }
         let route_id = app_messsage.route_id().unwrap();
@@ -246,7 +244,7 @@ impl TunnelManager {
 
         self.handle_message(&id, bytes).await?;
 
-        return Ok(());
+        Ok(())
     }
 
     async fn handle_remote_dead(&self, routes: &[CryptoKey]) {
@@ -268,7 +266,7 @@ impl TunnelManager {
         let router = veilid.routing_context()?;
         let (route_id, route_id_blob) = veilid.new_private_route().await?;
 
-        return Ok(Self::new(
+        Ok(Self::new(
             veilid,
             router,
             route_id,
@@ -276,7 +274,7 @@ impl TunnelManager {
             on_new_tunnel,
             on_route_disconnected_callback,
             on_new_route_callback,
-        ));
+        ))
     }
 
     pub fn new(
@@ -299,25 +297,23 @@ impl TunnelManager {
             on_new_route_callback,
         }));
 
-        let tunnels = TunnelManager {
+        TunnelManager {
             inner,
             veilid,
             on_new_tunnel,
-        };
-
-        return tunnels;
+        }
     }
 
     pub async fn route_id(&self) -> RouteId {
         let inner = self.inner.lock().await;
 
-        return inner.route_id.clone();
+        inner.route_id
     }
 
     pub async fn route_id_blob(&self) -> Vec<u8> {
         let inner = self.inner.lock().await;
 
-        return inner.route_id_blob.clone();
+        inner.route_id_blob.clone()
     }
 
     pub async fn open(&self, route_id_blob: Vec<u8>) -> Result<Tunnel> {
@@ -338,7 +334,7 @@ impl TunnelManager {
             inner.send_ping(&id).await?;
         }
 
-        return Ok(tunnel);
+        Ok(tunnel)
     }
 
     pub async fn listen(
@@ -349,24 +345,24 @@ impl TunnelManager {
             if let VeilidUpdate::AppMessage(app_message) = update {
                 self.handle_app_message(&app_message).await?;
             } else if let VeilidUpdate::RouteChange(route_change) = update {
-                if route_change.dead_remote_routes.len() != 0 {
+                if !route_change.dead_remote_routes.is_empty() {
                     self.handle_remote_dead(&route_change.dead_remote_routes)
                         .await;
                 }
-                if route_change.dead_routes.len() != 0 {
+                if !route_change.dead_routes.is_empty() {
                     self.handle_local_dead(&route_change.dead_routes).await;
                 }
             }
             //println!("{0} Got event in manager");
         }
 
-        return Ok(());
+        Ok(())
     }
 
     pub async fn shutdown(self) -> Result<()> {
         // TODO: close routes and tunnels first?
         self.veilid.shutdown().await;
-        return Ok(());
+        Ok(())
     }
 }
 
@@ -383,9 +379,9 @@ async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
             )
             .await;
 
-        if result.is_ok() {
-            return Ok(result.unwrap());
+        if let Ok(route) = result {
+            return Ok(route);
         }
     }
-    return Err(anyhow!("Unable to create route, reached max retries"));
+    Err(anyhow!("Unable to create route, reached max retries"))
 }
