@@ -422,29 +422,16 @@ impl VeilidIrohBlobs {
 
         return Ok(read);
     }
+   
     pub async fn create_collection(&self, collection_name: &String) -> anyhow::Result<Hash> {
         println!("Creating a new empty collection with name: {}", collection_name);
     
         // Create a new empty HashMap for the collection
         let collection: HashMap<String, Hash> = HashMap::new();
     
-        // Serialize the HashMap to CBOR
-        let cbor_data = to_vec(&collection)?;
-    
-        // Write the CBOR data to a temporary file
-        let temp_path = self.base_dir.join(format!("{}_collection.cbor", collection_name));
-        std::fs::write(&temp_path, &cbor_data)?;
-    
-        // Convert the path to an absolute path and upload it to the store
-        let absolute_temp_path = std::fs::canonicalize(&temp_path)?;
-        let collection_hash = self.upload_from_path(absolute_temp_path).await?;
-    
-        // Store the new collection hash using the tag system
-        self.store.set_tag(
-            collection_name.to_string().into(),
-            Some(HashAndFormat::new(collection_hash, BlobFormat::Raw)),
-        ).await?;
-    
+        // Create collection with collection_name and collection HashMap
+        let collection_hash = self.update_collection(&collection_name, &collection).await?;
+
         println!("Collection created successfully with hash: {:?}", collection_hash);
         Ok(collection_hash)
     }
@@ -475,20 +462,9 @@ impl VeilidIrohBlobs {
         // Add or update the file in the collection (HashMap)
         collection.insert(path.clone(), file_hash.clone());
 
-        // Serialize the updated HashMap to CBOR
-        let cbor_data = to_vec(&collection)?;
+        // Update collection with collection_name and collection HashMap
+        let new_collection_hash = self.update_collection(&collection_name, &collection).await?;
 
-        // Upload the updated collection data to the store
-        let temp_path = self.base_dir.join("updated_collection.cbor");
-        std::fs::write(&temp_path, &cbor_data)?;
-        let absolute_temp_path = std::fs::canonicalize(&temp_path)?;
-        let new_collection_hash = self.upload_from_path(absolute_temp_path).await?;
-
-        // Log: Print the new collection hash
-        println!("New collection hash: {:?}", new_collection_hash);
-
-        // Store the new collection hash with the tag
-        self.store_tag(&collection_name, &new_collection_hash).await?;
         Ok(new_collection_hash)
     }
     pub async fn get_file(&self, collection_name: &String, path: &String) -> Result<Hash> {
@@ -535,17 +511,8 @@ impl VeilidIrohBlobs {
         // Remove the file from the collection
         collection.remove(path);
     
-        // Serialize the updated HashMap to CBOR
-        let cbor_data = to_vec(&collection)?;
-    
-        // Write the CBOR data to a temporary file and upload it to the store
-        let temp_path = self.base_dir.join("updated_collection.cbor");
-        std::fs::write(&temp_path, &cbor_data)?;
-        let absolute_temp_path = std::fs::canonicalize(&temp_path)?;
-        let new_collection_hash = self.upload_from_path(absolute_temp_path).await?;
-    
-        // Store the new collection hash with the tag
-        self.store_tag(&collection_name, &new_collection_hash).await?;
+        // Update collection with collection_name and updated collection HashMap
+        let new_collection_hash = self.update_collection(&collection_name, &collection).await?;
     
         Ok(new_collection_hash)
     }
@@ -646,6 +613,37 @@ impl VeilidIrohBlobs {
         }
     
         Err(anyhow!("Tag not found for collection: {}", collection_name))
+    }
+
+    pub async fn update_collection(
+        &self,
+        collection_name: &String,
+        collection: &HashMap<String, Hash>,
+    ) -> Result<Hash> {
+        // Serialize the updated HashMap to CBOR
+        let cbor_data = to_vec(&collection)?;
+
+        // Create a channel for streaming the CBOR data
+        let (sender, receiver) = mpsc::channel(1);
+        let cbor_bytes = Bytes::from(cbor_data);
+
+        // Spawn a task to send the CBOR bytes via the sender
+        tokio::spawn(async move {
+            if let Err(e) = sender.send(Ok(cbor_bytes)).await {
+                eprintln!("Failed to send CBOR data: {}", e);
+            }
+        });
+
+        // Upload the CBOR data via upload_from_stream and get the new collection hash
+        let new_collection_hash = self.upload_from_stream(receiver).await?;
+
+        // Log: Print the new collection hash
+        println!("New collection hash: {:?}", new_collection_hash);
+
+        // Store the new collection hash with the tag
+        self.store_tag(collection_name, &new_collection_hash).await?;
+
+        Ok(new_collection_hash)
     }
     
 
