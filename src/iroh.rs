@@ -471,6 +471,25 @@ impl VeilidIrohBlobs {
         Ok(collection.keys().cloned().collect())
     }
 
+    pub async fn list_files_from_hash(&self, collection_hash: &Hash) ->  Result<Vec<String>> {
+        // Fetch the collection data using the collection hash
+        let entry = self
+        .store
+        .get(collection_hash)
+        .await?
+        .ok_or_else(|| anyhow!("Collection not found for hash: {}", collection_hash))?;
+        
+        // Read the serialized collection data directly
+        let collection_data = self.read_bytes(*collection_hash).await?;
+
+        // Deserialize the collection into a HashMap
+        let collection: HashMap<String, Hash> = from_slice(&collection_data)
+            .map_err(|err| anyhow!("Failed to deserialize collection: {:?}", err))?;
+
+        // Return the list of file names (keys in the HashMap)
+        Ok(collection.keys().cloned().collect())
+    }
+
     pub async fn upload_to(
         &self,
         collection_name: &str,
