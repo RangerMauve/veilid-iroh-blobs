@@ -511,6 +511,22 @@ impl VeilidIrohBlobs {
             .ok_or_else(|| anyhow!("File not found for path: {}", path))
     }
 
+    pub async fn delete_file_from_collection_hash(
+        &self,
+        collection_hash: &Hash,
+        path: &str,
+    ) -> Result<Hash> {
+        // Fetch the collection using the collection hash
+        let mut collection = self.get_collection_from_hash(collection_hash).await?;
+    
+        // Remove the file from the collection
+        collection.remove(path);
+    
+        // Update the collection and return the new collection hash
+        let new_collection_hash = self.update_collection_with_hash(collection_hash, &collection).await?;
+        Ok(new_collection_hash)
+    }
+
     pub async fn get_collection_from_hash(
         &self,
         collection_hash: &Hash,
