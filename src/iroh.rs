@@ -414,7 +414,7 @@ impl VeilidIrohBlobs {
         let collection: FileCollection = HashMap::new();
 
         // Create collection with collection_name and collection HashMap
-        let collection_hash = self.update_collection(collection_name, &collection).await?;
+        let collection_hash = self.update_collection(Some(collection_name), None, &collection).await?;
         Ok(collection_hash)
     }
 
@@ -439,7 +439,7 @@ impl VeilidIrohBlobs {
         collection.insert(path.to_string().clone(), *file_hash);
 
         // Update collection with collection_name and collection HashMap
-        let new_collection_hash = self.update_collection(collection_name, &collection).await?;
+        let new_collection_hash = self.update_collection(Some(collection_name), None, &collection).await?;
 
         Ok(new_collection_hash)
     }
@@ -460,7 +460,7 @@ impl VeilidIrohBlobs {
         collection.remove(path);
 
         // Update collection with collection_name and updated collection HashMap
-        let new_collection_hash = self.update_collection(collection_name, &collection).await?;
+        let new_collection_hash = self.update_collection(Some(collection_name), None, &collection).await?;
 
         Ok(new_collection_hash)
     }
