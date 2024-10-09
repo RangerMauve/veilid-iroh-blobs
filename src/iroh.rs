@@ -629,29 +629,44 @@ impl VeilidIrohBlobs {
         self.update_collection(None, Some(collection_hash), collection).await
     }
 
+    pub async fn update_collection(
+        &self,
+        collection_name: Option<&str>,
+        collection_hash: Option<&Hash>,
+        collection: &FileCollection,
+    ) -> Result<Hash> {
+        // Retrieve the collection name if only the collection_hash is provided
+        let collection_name = if let Some(name) = collection_name {
+            name.to_string()
+        } else if let Some(hash) = collection_hash {
+            self.get_name_from_hash(hash).await?
+        } else {
+            return Err(anyhow!("Either collection_name or collection_hash must be provided"));
+        };
+    
         // Serialize the updated HashMap to CBOR
         let cbor_data = to_vec(&collection)?;
-
+    
         // Create a channel for streaming the CBOR data
         let (sender, receiver) = mpsc::channel(1);
         let cbor_bytes = Bytes::from(cbor_data);
-
+    
         // Spawn a task to send the CBOR bytes via the sender
         tokio::spawn(async move {
             if let Err(e) = sender.send(std::io::Result::Ok(cbor_bytes)).await {
                 eprintln!("Failed to send CBOR data: {}", e);
             }
         });
-
+    
         // Upload the CBOR data via upload_from_stream and get the new collection hash
         let new_collection_hash = self.upload_from_stream(receiver).await?;
-
-        // Store the new collection hash with the tag
-        self.store_tag(collection_name, &new_collection_hash)
-            .await?;
-
+    
+        // Store the new collection hash with the tag (collection name)
+        self.store_tag(&collection_name, &new_collection_hash).await?;
+    
         Ok(new_collection_hash)
     }
+    
 
     pub async fn route_id_blob(&self) -> Vec<u8> {
         self.tunnels.route_id_blob().await
