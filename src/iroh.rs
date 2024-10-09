@@ -413,9 +413,38 @@ impl VeilidIrohBlobs {
         // Create a new empty HashMap for the collection
         let collection: FileCollection = HashMap::new();
 
-        // Create collection with collection_name and collection HashMap
-        let collection_hash = self.update_collection_with_name(collection_name, &collection).await?;
+        // Directly create and persist the collection with the provided name and HashMap
+        let collection_hash = self.persist_new_collection(collection_name, &collection).await?;
+
         Ok(collection_hash)
+    }
+
+    pub async fn persist_new_collection(
+        &self,
+        collection_name: &str,
+        collection: &FileCollection,
+    ) -> Result<Hash> {
+        // Serialize the collection data
+        let cbor_data = to_vec(&collection)?;
+    
+        // Create a channel for streaming the CBOR data
+        let (sender, receiver) = mpsc::channel(1);
+        let cbor_bytes = Bytes::from(cbor_data);
+    
+        // Spawn a task to send the CBOR bytes via the sender
+        tokio::spawn(async move {
+            if let Err(e) = sender.send(std::io::Result::Ok(cbor_bytes)).await {
+                eprintln!("Failed to send CBOR data: {}", e);
+            }
+        });
+    
+        // Upload the CBOR data via upload_from_stream and get the new collection hash
+        let new_collection_hash = self.upload_from_stream(receiver).await?;
+    
+        // Use `persist_collection_with_name` to store the collection hash with the collection name
+        self.persist_collection_with_name(collection_name, &new_collection_hash).await?;
+    
+        Ok(new_collection_hash)
     }
 
     async fn get_collection(&self, collection_name: &str) -> Result<FileCollection> {
@@ -618,13 +647,25 @@ impl VeilidIrohBlobs {
         collection_name: &str,
         collection: &FileCollection,
     ) -> Result<Hash> {
-        // Retrieve the collection hash from the name
-        let collection_hash = self.collection_hash(collection_name).await?;
-
-        // Delegate to update_collection_with_hash
-        let new_collection_hash = self.update_collection_with_hash(&collection_hash, collection).await?;
-
-        Ok(new_collection_hash)
+        // Try to retrieve the collection hash
+        match self.collection_hash(collection_name).await {
+            std::result::Result::Ok(collection_hash) => {
+                // If the collection exists, update the collection
+                let new_collection_hash = self.update_collection_with_hash(&collection_hash, collection).await?;
+                
+                // Persist the updated collection hash with the collection name
+                self.persist_collection_with_name(collection_name, &new_collection_hash).await?;
+    
+                // Return the new collection hash
+                std::result::Result::Ok(new_collection_hash)
+            }
+            std::result::Result::Err(_) => {
+                // If the collection doesn't exist, create and persist a new one
+                println!("Collection does not exist, creating a new one.");
+                let new_collection_hash = self.persist_new_collection(collection_name, collection).await?;
+                std::result::Result::Ok(new_collection_hash)
+            }
+        }
     }
     
     pub async fn update_collection_with_hash(
