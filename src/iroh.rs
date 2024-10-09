@@ -583,7 +583,7 @@ impl VeilidIrohBlobs {
         self.get_tag(collection_name).await
     }
 
-    pub async fn store_tag(&self, collection_name: &str, collection_hash: &Hash) -> Result<()> {
+    pub async fn persist_collection_with_name(&self, collection_name: &str, collection_hash: &Hash) -> Result<()> {
         // Store the tag
         self.store
             .set_tag(
