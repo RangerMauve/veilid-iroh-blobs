@@ -548,7 +548,23 @@ impl VeilidIrohBlobs {
         Ok(collection)
     }
 
-
+    pub async fn get_name_from_hash(&self, collection_hash: &Hash) -> Result<String> {
+        let tags = self.store.tags().await?;
+    
+        for tag_result in tags {
+            let (tag, hash_and_format) = tag_result.map_err(|e| anyhow!("Error reading tags: {:?}", e))?;
+    
+            // Check if the hash matches the provided collection_hash
+            if hash_and_format.hash == *collection_hash {
+                // Convert the tag bytes to a String and return it as the collection name
+                return String::from_utf8(tag.0.to_vec())
+                    .map_err(|e| anyhow!("Failed to convert tag to String: {:?}", e));
+            }
+        }
+    
+        Err(anyhow!("Collection name not found for hash: {}", collection_hash))
+    }
+    
     pub async fn upload_to(
         &self,
         collection_name: &str,
