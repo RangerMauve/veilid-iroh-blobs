@@ -618,7 +618,13 @@ impl VeilidIrohBlobs {
         collection_name: &str,
         collection: &FileCollection,
     ) -> Result<Hash> {
-        self.update_collection(Some(collection_name), None, collection).await
+        // Retrieve the collection hash from the name
+        let collection_hash = self.collection_hash(collection_name).await?;
+
+        // Delegate to update_collection_with_hash
+        let new_collection_hash = self.update_collection_with_hash(&collection_hash, collection).await?;
+
+        Ok(new_collection_hash)
     }
     
     pub async fn update_collection_with_hash(
@@ -626,24 +632,6 @@ impl VeilidIrohBlobs {
         collection_hash: &Hash,
         collection: &FileCollection,
     ) -> Result<Hash> {
-        self.update_collection(None, Some(collection_hash), collection).await
-    }
-
-    pub async fn update_collection(
-        &self,
-        collection_name: Option<&str>,
-        collection_hash: Option<&Hash>,
-        collection: &FileCollection,
-    ) -> Result<Hash> {
-        // Retrieve the collection name if only the collection_hash is provided
-        let collection_name = if let Some(name) = collection_name {
-            name.to_string()
-        } else if let Some(hash) = collection_hash {
-            self.get_name_from_hash(hash).await?
-        } else {
-            return Err(anyhow!("Either collection_name or collection_hash must be provided"));
-        };
-    
         // Serialize the updated HashMap to CBOR
         let cbor_data = to_vec(&collection)?;
     
@@ -660,9 +648,6 @@ impl VeilidIrohBlobs {
     
         // Upload the CBOR data via upload_from_stream and get the new collection hash
         let new_collection_hash = self.upload_from_stream(receiver).await?;
-    
-        // Store the new collection hash with the tag (collection name)
-        self.store_tag(&collection_name, &new_collection_hash).await?;
     
         Ok(new_collection_hash)
     }
