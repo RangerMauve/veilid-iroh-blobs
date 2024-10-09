@@ -479,6 +479,23 @@ impl VeilidIrohBlobs {
         Ok(collection.keys().cloned().collect())
     }
 
+    pub async fn set_file_from_collection_hash(
+        &self,
+        collection_hash: &Hash,
+        path: &str,
+        file_hash: &Hash,
+    ) -> Result<Hash> {
+        // Fetch the collection using the collection hash
+        let mut collection = self.get_collection_from_hash(collection_hash).await?;
+    
+        // Add or update the file in the collection (HashMap)
+        collection.insert(path.to_string().clone(), *file_hash);
+    
+        // Update the collection and return the new collection hash
+        let new_collection_hash = self.update_collection_with_hash(collection_hash, &collection).await?;
+        Ok(new_collection_hash)
+    }
+
     pub async fn get_file_from_collection_hash(
         &self,
         collection_hash: &Hash,
