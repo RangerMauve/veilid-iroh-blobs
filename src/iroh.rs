@@ -602,6 +602,7 @@ impl VeilidIrohBlobs {
         collection_name: &str,
         collection: &FileCollection,
     ) -> Result<Hash> {
+
         // Serialize the updated HashMap to CBOR
         let cbor_data = to_vec(&collection)?;
 
