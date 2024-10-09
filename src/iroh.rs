@@ -597,11 +597,21 @@ impl VeilidIrohBlobs {
         Err(anyhow!("Tag not found for collection: {}", collection_name))
     }
 
-    pub async fn update_collection(
+    pub async fn update_collection_with_name(
         &self,
         collection_name: &str,
         collection: &FileCollection,
     ) -> Result<Hash> {
+        self.update_collection(Some(collection_name), None, collection).await
+    }
+    
+    pub async fn update_collection_with_hash(
+        &self,
+        collection_hash: &Hash,
+        collection: &FileCollection,
+    ) -> Result<Hash> {
+        self.update_collection(None, Some(collection_hash), collection).await
+    }
 
         // Serialize the updated HashMap to CBOR
         let cbor_data = to_vec(&collection)?;
