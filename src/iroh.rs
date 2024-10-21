@@ -45,7 +45,7 @@ const DATA: u8 = 0x20u8;
 const DONE: u8 = 0x22u8;
 const ERR: u8 = 0xF0u8;
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_millis(4000);
+const DEFAULT_TIMEOUT: Duration = Duration::from_millis(16000);
 
 #[derive(Clone)]
 pub struct VeilidIrohBlobs {
@@ -414,7 +414,9 @@ impl VeilidIrohBlobs {
         let collection: FileCollection = HashMap::new();
 
         // Directly create and persist the collection with the provided name and HashMap
-        let collection_hash = self.persist_new_collection(collection_name, &collection).await?;
+        let collection_hash = self
+            .persist_new_collection(collection_name, &collection)
+            .await?;
 
         Ok(collection_hash)
     }
@@ -426,24 +428,25 @@ impl VeilidIrohBlobs {
     ) -> Result<Hash> {
         // Serialize the collection data
         let cbor_data = to_vec(&collection)?;
-    
+
         // Create a channel for streaming the CBOR data
         let (sender, receiver) = mpsc::channel(1);
         let cbor_bytes = Bytes::from(cbor_data);
-    
+
         // Spawn a task to send the CBOR bytes via the sender
         tokio::spawn(async move {
             if let Err(e) = sender.send(std::io::Result::Ok(cbor_bytes)).await {
                 eprintln!("Failed to send CBOR data: {}", e);
             }
         });
-    
+
         // Upload the CBOR data via upload_from_stream and get the new collection hash
         let new_collection_hash = self.upload_from_stream(receiver).await?;
-    
+
         // Use `persist_collection_with_name` to store the collection hash with the collection name
-        self.persist_collection_with_name(collection_name, &new_collection_hash).await?;
-    
+        self.persist_collection_with_name(collection_name, &new_collection_hash)
+            .await?;
+
         Ok(new_collection_hash)
     }
 
@@ -468,7 +471,9 @@ impl VeilidIrohBlobs {
         collection.insert(path.to_string().clone(), *file_hash);
 
         // Update collection with collection_name and collection HashMap
-        let new_collection_hash = self.update_collection_with_name(collection_name, &collection).await?;
+        let new_collection_hash = self
+            .update_collection_with_name(collection_name, &collection)
+            .await?;
 
         Ok(new_collection_hash)
     }
@@ -489,7 +494,9 @@ impl VeilidIrohBlobs {
         collection.remove(path);
 
         // Update collection with collection_name and updated collection HashMap
-        let new_collection_hash = self.update_collection_with_name(collection_name, &collection).await?;
+        let new_collection_hash = self
+            .update_collection_with_name(collection_name, &collection)
+            .await?;
 
         Ok(new_collection_hash)
     }
@@ -503,7 +510,7 @@ impl VeilidIrohBlobs {
     pub async fn list_files_from_hash(&self, collection_hash: &Hash) -> Result<Vec<String>> {
         // Use this method to get the collection HashMap
         let collection = self.get_collection_from_hash(collection_hash).await?;
-        
+
         // Return the list of file names (keys in the HashMap)
         Ok(collection.keys().cloned().collect())
     }
@@ -516,12 +523,14 @@ impl VeilidIrohBlobs {
     ) -> Result<Hash> {
         // Fetch the collection using the collection hash
         let mut collection = self.get_collection_from_hash(collection_hash).await?;
-    
+
         // Add or update the file in the collection (HashMap)
         collection.insert(path.to_string().clone(), *file_hash);
-    
+
         // Update the collection and return the new collection hash
-        let new_collection_hash = self.update_collection_with_hash(collection_hash, &collection).await?;
+        let new_collection_hash = self
+            .update_collection_with_hash(collection_hash, &collection)
+            .await?;
         Ok(new_collection_hash)
     }
 
@@ -530,7 +539,7 @@ impl VeilidIrohBlobs {
         collection_hash: &Hash,
         path: &str,
     ) -> Result<Hash> {
-       // Use the new method to get the collection HashMap
+        // Use the new method to get the collection HashMap
         let collection = self.get_collection_from_hash(collection_hash).await?;
 
         // Find and return the file hash associated with the given path
@@ -547,12 +556,14 @@ impl VeilidIrohBlobs {
     ) -> Result<Hash> {
         // Fetch the collection using the collection hash
         let mut collection = self.get_collection_from_hash(collection_hash).await?;
-    
+
         // Remove the file from the collection
         collection.remove(path);
-    
+
         // Update the collection and return the new collection hash
-        let new_collection_hash = self.update_collection_with_hash(collection_hash, &collection).await?;
+        let new_collection_hash = self
+            .update_collection_with_hash(collection_hash, &collection)
+            .await?;
         Ok(new_collection_hash)
     }
 
@@ -566,23 +577,24 @@ impl VeilidIrohBlobs {
             .get(collection_hash)
             .await?
             .ok_or_else(|| anyhow!("Collection not found for hash: {}", collection_hash))?;
-        
+
         // Read the serialized collection data directly
         let collection_data = self.read_bytes(*collection_hash).await?;
-    
+
         // Deserialize the collection into a HashMap
         let collection: HashMap<String, Hash> = from_slice(&collection_data)
             .map_err(|err| anyhow!("Failed to deserialize collection: {:?}", err))?;
-    
+
         Ok(collection)
     }
 
     pub async fn get_name_from_hash(&self, collection_hash: &Hash) -> Result<String> {
         let tags = self.store.tags().await?;
-    
+
         for tag_result in tags {
-            let (tag, hash_and_format) = tag_result.map_err(|e| anyhow!("Error reading tags: {:?}", e))?;
-    
+            let (tag, hash_and_format) =
+                tag_result.map_err(|e| anyhow!("Error reading tags: {:?}", e))?;
+
             // Check if the hash matches the provided collection_hash
             if hash_and_format.hash == *collection_hash {
                 // Convert the tag bytes to a String and return it as the collection name
@@ -590,10 +602,13 @@ impl VeilidIrohBlobs {
                     .map_err(|e| anyhow!("Failed to convert tag to String: {:?}", e));
             }
         }
-    
-        Err(anyhow!("Collection name not found for hash: {}", collection_hash))
+
+        Err(anyhow!(
+            "Collection name not found for hash: {}",
+            collection_hash
+        ))
     }
-    
+
     pub async fn upload_to(
         &self,
         collection_name: &str,
@@ -612,7 +627,11 @@ impl VeilidIrohBlobs {
         self.get_tag(collection_name).await
     }
 
-    pub async fn persist_collection_with_name(&self, collection_name: &str, collection_hash: &Hash) -> Result<()> {
+    pub async fn persist_collection_with_name(
+        &self,
+        collection_name: &str,
+        collection_hash: &Hash,
+    ) -> Result<()> {
         // Store the tag
         self.store
             .set_tag(
@@ -651,23 +670,28 @@ impl VeilidIrohBlobs {
         match self.collection_hash(collection_name).await {
             std::result::Result::Ok(collection_hash) => {
                 // If the collection exists, update the collection
-                let new_collection_hash = self.update_collection_with_hash(&collection_hash, collection).await?;
-                
+                let new_collection_hash = self
+                    .update_collection_with_hash(&collection_hash, collection)
+                    .await?;
+
                 // Persist the updated collection hash with the collection name
-                self.persist_collection_with_name(collection_name, &new_collection_hash).await?;
-    
+                self.persist_collection_with_name(collection_name, &new_collection_hash)
+                    .await?;
+
                 // Return the new collection hash
                 std::result::Result::Ok(new_collection_hash)
             }
             std::result::Result::Err(_) => {
                 // If the collection doesn't exist, create and persist a new one
                 println!("Collection does not exist, creating a new one.");
-                let new_collection_hash = self.persist_new_collection(collection_name, collection).await?;
+                let new_collection_hash = self
+                    .persist_new_collection(collection_name, collection)
+                    .await?;
                 std::result::Result::Ok(new_collection_hash)
             }
         }
     }
-    
+
     pub async fn update_collection_with_hash(
         &self,
         collection_hash: &Hash,
@@ -675,24 +699,23 @@ impl VeilidIrohBlobs {
     ) -> Result<Hash> {
         // Serialize the updated HashMap to CBOR
         let cbor_data = to_vec(&collection)?;
-    
+
         // Create a channel for streaming the CBOR data
         let (sender, receiver) = mpsc::channel(1);
         let cbor_bytes = Bytes::from(cbor_data);
-    
+
         // Spawn a task to send the CBOR bytes via the sender
         tokio::spawn(async move {
             if let Err(e) = sender.send(std::io::Result::Ok(cbor_bytes)).await {
                 eprintln!("Failed to send CBOR data: {}", e);
             }
         });
-    
+
         // Upload the CBOR data via upload_from_stream and get the new collection hash
         let new_collection_hash = self.upload_from_stream(receiver).await?;
-    
+
         Ok(new_collection_hash)
     }
-    
 
     pub async fn route_id_blob(&self) -> Vec<u8> {
         self.tunnels.route_id_blob().await
