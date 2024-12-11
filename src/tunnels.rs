@@ -11,8 +11,9 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Mutex;
 use veilid_core::CryptoKey;
+use veilid_core::OperationId;
 use veilid_core::VeilidAPI;
-use veilid_core::VeilidAppMessage;
+use veilid_core::VeilidAppCall;
 use veilid_core::VALID_CRYPTO_KINDS;
 use veilid_core::{RouteId, RoutingContext, Target, VeilidUpdate, CRYPTO_KEY_LENGTH};
 
@@ -26,10 +27,24 @@ pub type OnNewRouteCallback = Arc<dyn Fn(RouteId, Vec<u8>) + Send + Sync>;
 static PING_BYTES: &[u8] = &[7, 2, 8, 3];
 
 #[repr(u8)]
+#[derive(PartialEq)]
 pub enum TunnelResult {
     Success = 0,
     InvalidFormat = 1,
     Closed = 2,
+}
+
+impl TryFrom<u8> for TunnelResult {
+    type Error = anyhow::Error;
+
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            x if x == TunnelResult::Success as u8 => Ok(TunnelResult::Success),
+            x if x == TunnelResult::InvalidFormat as u8 => Ok(TunnelResult::InvalidFormat),
+            x if x == TunnelResult::Closed as u8 => Ok(TunnelResult::Closed),
+            _ => Err(anyhow!("Invalid tunnel result value {:?}", v)),
+        }
+    }
 }
 
 struct TunnelManagerInner {
@@ -63,11 +78,21 @@ impl TunnelManagerInner {
         buffer.put_u32(id.1);
         buffer.put(bytes.as_slice());
         let target = Target::PrivateRoute(id.0);
-        let result = self.router.app_message(target, buffer.to_vec()).await;
+        let result = self.router.app_call(target, buffer.to_vec()).await?;
 
-        match result {
-            Ok(_) => Ok(()),
-            Err(err) => Err(anyhow!("{}", err)),
+        if result.len() != 1 {
+            return Err(anyhow!(
+                "Got invalid response length from app call: {:?}",
+                result
+            ));
+        }
+
+        let code: TunnelResult = result[0].try_into()?;
+
+        match code {
+            TunnelResult::Success => Ok(()),
+            TunnelResult::Closed => Err(anyhow!("Tunnel closed")),
+            TunnelResult::InvalidFormat => Err(anyhow!("Invalid Format")),
         }
     }
 
@@ -212,17 +237,19 @@ impl TunnelManager {
         Ok(())
     }
 
-    async fn handle_app_message(&self, app_messsage: &Box<VeilidAppMessage>) -> Result<()> {
+    async fn handle_app_call(&self, app_call: &Box<VeilidAppCall>) -> Result<()> {
         // No route or wrong route means it's prob from elsewhere
-        if app_messsage.route_id().is_none() {
+        if app_call.route_id().is_none() {
             return Ok(());
         }
-        let route_id = app_messsage.route_id().unwrap();
+        let route_id = app_call.route_id().unwrap();
         if route_id != &self.route_id().await {
             return Ok(());
         }
 
-        let mut buffer = Bytes::copy_from_slice(app_messsage.message());
+        let call_id = app_call.id();
+
+        let mut buffer = Bytes::copy_from_slice(app_call.message());
 
         // THis is all to read 32 bytes into a fixed buffer 💀
         let route_id_buffer = buffer.get(0..32);
@@ -231,7 +258,7 @@ impl TunnelManager {
         }
         let route_id_buffer = route_id_buffer.unwrap();
         let mut route_key_raw: [u8; CRYPTO_KEY_LENGTH] = [0; CRYPTO_KEY_LENGTH];
-        route_key_raw.writer().write(route_id_buffer)?;
+        route_key_raw.writer().write_all(route_id_buffer)?;
         let route_key = CryptoKey::from(route_key_raw);
 
         // Apparently .get(index) doesn't advance the buffer 🤷
@@ -242,8 +269,16 @@ impl TunnelManager {
 
         let id: TunnelId = (route_key, tunnel_number);
 
-        self.handle_message(&id, bytes).await?;
+        match self.handle_message(&id, bytes).await {
+            Ok(_) => self.app_call_reply(call_id, TunnelResult::Success).await,
+            Err(_) => self.app_call_reply(call_id, TunnelResult::Closed).await,
+        }
+    }
 
+    async fn app_call_reply(&self, call_id: OperationId, result: TunnelResult) -> Result<()> {
+        self.veilid
+            .app_call_reply(call_id, vec![result as u8])
+            .await?;
         Ok(())
     }
 
@@ -342,8 +377,8 @@ impl TunnelManager {
         mut updates: tokio::sync::broadcast::Receiver<VeilidUpdate>,
     ) -> Result<()> {
         while let Ok(update) = updates.recv().await {
-            if let VeilidUpdate::AppMessage(app_message) = update {
-                self.handle_app_message(&app_message).await?;
+            if let VeilidUpdate::AppCall(app_call) = update {
+                self.handle_app_call(&app_call).await?;
             } else if let VeilidUpdate::RouteChange(route_change) = update {
                 if !route_change.dead_remote_routes.is_empty() {
                     self.handle_remote_dead(&route_change.dead_remote_routes)
@@ -374,8 +409,8 @@ async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
         let result = veilid
             .new_custom_private_route(
                 &VALID_CRYPTO_KINDS,
-                veilid_core::Stability::Reliable,
-                veilid_core::Sequencing::EnsureOrdered,
+                veilid_core::Stability::LowLatency,
+                veilid_core::Sequencing::NoPreference,
             )
             .await;
 

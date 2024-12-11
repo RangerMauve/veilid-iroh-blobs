@@ -3,7 +3,6 @@ use anyhow::Result;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::Receiver;
-use tokio::sync::mpsc;
 use veilid_core::{
     RouteId, UpdateCallback, VeilidAPI, VeilidConfigInner, VeilidUpdate, VALID_CRYPTO_KINDS,
 };
@@ -993,8 +992,8 @@ async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
         let result = veilid
             .new_custom_private_route(
                 &VALID_CRYPTO_KINDS,
-                veilid_core::Stability::Reliable,
-                veilid_core::Sequencing::EnsureOrdered,
+                veilid_core::Stability::LowLatency,
+                veilid_core::Sequencing::NoPreference,
             )
             .await;
 
