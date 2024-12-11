@@ -258,7 +258,7 @@ impl TunnelManager {
         }
         let route_id_buffer = route_id_buffer.unwrap();
         let mut route_key_raw: [u8; CRYPTO_KEY_LENGTH] = [0; CRYPTO_KEY_LENGTH];
-        route_key_raw.writer().write(route_id_buffer)?;
+        route_key_raw.writer().write_all(route_id_buffer)?;
         let route_key = CryptoKey::from(route_key_raw);
 
         // Apparently .get(index) doesn't advance the buffer 🤷
