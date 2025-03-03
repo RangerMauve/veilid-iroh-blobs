@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 use anyhow::anyhow;
 use anyhow::Result;
 use std::{path::PathBuf, sync::Arc};
@@ -20,7 +21,7 @@ mod tests {
     use anyhow::Result;
     use bytes::Bytes;
     use core::str;
-    use futures_lite::{Stream, StreamExt};
+    use futures_lite::StreamExt;
     use std::path::Path;
     use std::{path::PathBuf, sync::Arc};
     use tokio::sync::broadcast;
