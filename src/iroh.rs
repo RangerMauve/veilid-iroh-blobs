@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::Mutex;
 use std::time::Duration;
-use std::{path::PathBuf, sync::Arc};
+use std::{path::{Path, PathBuf}, sync::Arc};
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -47,6 +47,17 @@ const ERR: u8 = 0xF0u8;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(32000);
 
+pub struct VeilidIrohBlobsConfig {
+    pub veilid: VeilidAPI,
+    pub router: RoutingContext,
+    pub route_id_blob: Vec<u8>,
+    pub route_id: RouteId,
+    pub updates: Receiver<VeilidUpdate>,
+    pub store: iroh_blobs::store::fs::Store,
+    pub on_route_disconnected_callback: Option<OnRouteDisconnectedCallback>,
+    pub on_new_route_callback: Option<OnNewRouteCallback>,
+}
+
 #[derive(Clone)]
 pub struct VeilidIrohBlobs {
     tunnels: TunnelManager,
@@ -56,7 +67,7 @@ pub struct VeilidIrohBlobs {
 
 impl VeilidIrohBlobs {
     pub async fn from_directory(
-        base_dir: &PathBuf,
+        base_dir: &Path,
         namespace: Option<String>,
         on_route_disconnected_callback: Option<OnRouteDisconnectedCallback>,
         on_new_route_callback: Option<OnNewRouteCallback>,
@@ -66,7 +77,7 @@ impl VeilidIrohBlobs {
         let router = veilid.routing_context()?;
         let (route_id, route_id_blob) = make_route(&veilid).await?;
 
-        let blobs = Self::new(
+        let config = VeilidIrohBlobsConfig {
             veilid,
             router,
             route_id_blob,
@@ -75,21 +86,22 @@ impl VeilidIrohBlobs {
             store,
             on_route_disconnected_callback,
             on_new_route_callback,
-        );
+        };
 
-        Ok(blobs)
+        Ok(Self::new(config))
     }
 
-    pub fn new(
-        veilid: VeilidAPI,
-        router: RoutingContext,
-        route_id_blob: Vec<u8>,
-        route_id: RouteId,
-        updates: Receiver<VeilidUpdate>,
-        store: iroh_blobs::store::fs::Store,
-        on_route_disconnected_callback: Option<OnRouteDisconnectedCallback>,
-        on_new_route_callback: Option<OnNewRouteCallback>,
-    ) -> Self {
+    pub fn new(config: VeilidIrohBlobsConfig) -> Self {
+        let VeilidIrohBlobsConfig {
+            veilid,
+            router,
+            route_id_blob,
+            route_id,
+            updates,
+            store,
+            on_route_disconnected_callback,
+            on_new_route_callback,
+        } = config;
         let (send_tunnel, read_tunnel) = mpsc::channel::<Tunnel>(1);
 
         let on_new_tunnel: OnNewTunnelCallback = Arc::new(move |tunnel| {
@@ -137,10 +149,12 @@ impl VeilidIrohBlobs {
 
     pub async fn shutdown(self) -> Result<()> {
         // Shutdown the handles
-        let handles = self.handles.lock().unwrap();
-        for handle in handles.iter() {
-            handle.abort();
-        }
+        {
+            let handles = self.handles.lock().unwrap();
+            for handle in handles.iter() {
+                handle.abort();
+            }
+        } // Drop the lock before awaiting
         self.tunnels.shutdown().await?;
         self.store.shutdown().await;
         Ok(())
@@ -202,7 +216,7 @@ impl VeilidIrohBlobs {
                                 to_send.put_u8(DATA);
                                 to_send.put(chunk);
 
-                                if let Err(_) = send.send(to_send.to_vec()).await {
+                                if send.send(to_send.to_vec()).await.is_err() {
                                     return;
                                 }
                             }
@@ -262,11 +276,11 @@ impl VeilidIrohBlobs {
 
         let command = result[0];
         if command == YES {
-            return Ok(true);
+            Ok(true)
         } else if command == NO {
-            return Ok(false);
+            Ok(false)
         } else {
-            return Err(anyhow!("Invalid response code from peer {:?}", command));
+            Err(anyhow!("Invalid response code from peer {:?}", command))
         }
     }
 
@@ -334,7 +348,7 @@ impl VeilidIrohBlobs {
                         let _ = send_file
                             .send(std::io::Result::Err(std::io::Error::new(
                                 ErrorKind::InvalidData,
-                                format!("Peer sent unexpected command {}", command),
+                                format!("Peer sent unexpected command {command}"),
                             )))
                             .await;
                         return;
@@ -348,10 +362,10 @@ impl VeilidIrohBlobs {
             let got_hash = self.upload_from_stream(read_file).await?;
 
             if got_hash.eq(hash) {
-                return Ok(());
+                Ok(())
             } else {
                 self.store.delete(vec![got_hash]).await?;
-                return Err(anyhow!("Peer returned invalid hash {}", got_hash));
+                Err(anyhow!("Peer returned invalid hash {got_hash}"))
             }
         } else if command == NO {
             return Err(anyhow!("Peer does not have hash"));
@@ -418,7 +432,7 @@ impl VeilidIrohBlobs {
                 let chunk = reader.read_at(index as u64, chunk_size).await;
 
                 if let Err(err) = send.send(chunk).await {
-                    eprintln!("Cannot send down channel {:?}", err);
+                    eprintln!("Cannot send down channel {err:?}");
                     return;
                 }
                 index += chunk_size
@@ -455,7 +469,7 @@ impl VeilidIrohBlobs {
         // Spawn a task to send the CBOR bytes via the sender
         tokio::spawn(async move {
             if let Err(e) = sender.send(std::io::Result::Ok(cbor_bytes)).await {
-                eprintln!("Failed to send CBOR data: {}", e);
+                eprintln!("Failed to send CBOR data: {e}");
             }
         });
 
@@ -590,12 +604,10 @@ impl VeilidIrohBlobs {
         &self,
         collection_hash: &Hash,
     ) -> Result<HashMap<String, Hash>> {
-        // Fetch the collection entry from the store using the collection hash
-        let entry = self
-            .store
-            .get(collection_hash)
-            .await?
-            .ok_or_else(|| anyhow!("Collection not found for hash: {}", collection_hash))?;
+        // Verify the collection exists
+        if self.store.get(collection_hash).await?.is_none() {
+            return Err(anyhow!("Collection not found for hash: {}", collection_hash));
+        }
 
         // Read the serialized collection data directly
         let collection_data = self.read_bytes(*collection_hash).await?;
@@ -716,6 +728,11 @@ impl VeilidIrohBlobs {
         collection_hash: &Hash,
         collection: &FileCollection,
     ) -> Result<Hash> {
+        // Verify the old collection exists before creating new version
+        if self.store.get(collection_hash).await?.is_none() {
+            return Err(anyhow!("Cannot update - collection hash {} not found", collection_hash));
+        }
+
         // Serialize the updated HashMap to CBOR
         let cbor_data = to_vec(&collection)?;
 
@@ -726,7 +743,7 @@ impl VeilidIrohBlobs {
         // Spawn a task to send the CBOR bytes via the sender
         tokio::spawn(async move {
             if let Err(e) = sender.send(std::io::Result::Ok(cbor_bytes)).await {
-                eprintln!("Failed to send CBOR data: {}", e);
+                eprintln!("Failed to send CBOR data: {e}");
             }
         });
 

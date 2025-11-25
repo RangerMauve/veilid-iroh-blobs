@@ -10,7 +10,6 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Mutex;
-use veilid_core::CryptoKey;
 use veilid_core::OperationId;
 use veilid_core::VeilidAPI;
 use veilid_core::VeilidAppCall;
@@ -109,7 +108,7 @@ impl TunnelManagerInner {
             .map_err(|err| anyhow!("Unable to send: {}", err))
     }
 
-    async fn handle_remote_dead(&mut self, routes: &[CryptoKey]) {
+    async fn handle_remote_dead(&mut self, routes: &[RouteId]) {
         for route_id in routes {
             for id in self.senders.clone().keys() {
                 if id.0 == *route_id {
@@ -118,7 +117,7 @@ impl TunnelManagerInner {
             }
         }
     }
-    async fn handle_local_dead(&mut self, routes: &[CryptoKey]) {
+    async fn handle_local_dead(&mut self, routes: &[RouteId]) {
         for route_id in routes {
             if *route_id != self.route_id {
                 continue;
@@ -237,7 +236,7 @@ impl TunnelManager {
         Ok(())
     }
 
-    async fn handle_app_call(&self, app_call: &Box<VeilidAppCall>) -> Result<()> {
+    async fn handle_app_call(&self, app_call: &VeilidAppCall) -> Result<()> {
         // No route or wrong route means it's prob from elsewhere
         if app_call.route_id().is_none() {
             return Ok(());
@@ -259,7 +258,7 @@ impl TunnelManager {
         let route_id_buffer = route_id_buffer.unwrap();
         let mut route_key_raw: [u8; CRYPTO_KEY_LENGTH] = [0; CRYPTO_KEY_LENGTH];
         route_key_raw.writer().write_all(route_id_buffer)?;
-        let route_key = CryptoKey::from(route_key_raw);
+        let route_key = RouteId { bytes: route_key_raw };
 
         // Apparently .get(index) doesn't advance the buffer 🤷
         buffer.advance(32);
@@ -282,12 +281,12 @@ impl TunnelManager {
         Ok(())
     }
 
-    async fn handle_remote_dead(&self, routes: &[CryptoKey]) {
+    async fn handle_remote_dead(&self, routes: &[RouteId]) {
         let mut inner = self.inner.lock().await;
         inner.handle_remote_dead(routes).await
     }
 
-    async fn handle_local_dead(&self, routes: &[CryptoKey]) {
+    async fn handle_local_dead(&self, routes: &[RouteId]) {
         let mut inner = self.inner.lock().await;
         inner.handle_local_dead(routes).await
     }
