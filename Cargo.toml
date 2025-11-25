@@ -1,6 +1,6 @@
 [package]
 name = "veilid-iroh-blobs"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -17,5 +17,5 @@ serde_cbor = "0.11.2"
 tokio = {version = "1.38.1", features = ["full", "tracing"]}
 tokio-stream = "0.1.15"
 tracing = "0.1.40"
-veilid-core = { git = "https://gitlab.com/veilid/veilid.git", tag = "v0.4.4" }
+veilid-core = { git = "https://gitlab.com/veilid/veilid.git", tag = "v0.4.8" }
 hex = "0.4"

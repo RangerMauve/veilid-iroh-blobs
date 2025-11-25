@@ -1,11 +1,11 @@
 #![recursion_limit = "256"]
 use anyhow::anyhow;
 use anyhow::Result;
-use std::{path::PathBuf, sync::Arc};
+use std::{path::{Path, PathBuf}, sync::Arc};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::Receiver;
 use veilid_core::{
-    RouteId, UpdateCallback, VeilidAPI, VeilidConfigInner, VeilidUpdate, VALID_CRYPTO_KINDS,
+    RouteId, UpdateCallback, VeilidAPI, VeilidConfig, VeilidUpdate, VALID_CRYPTO_KINDS,
 };
 
 pub mod iroh;
@@ -13,7 +13,7 @@ pub mod tunnels;
 
 #[cfg(test)]
 mod tests {
-    use crate::iroh::VeilidIrohBlobs;
+    use crate::iroh::{VeilidIrohBlobs, VeilidIrohBlobsConfig};
     use crate::tunnels::OnNewRouteCallback;
     use crate::tunnels::OnNewTunnelCallback;
     use crate::tunnels::OnRouteDisconnectedCallback;
@@ -29,12 +29,35 @@ mod tests {
     use tokio::time::{sleep, Duration};
     use veilid_core::VeilidUpdate;
 
+    /// Helper function to generate unique test directories and namespace
+    /// Returns (PathBuf, namespace_string)
+    fn get_test_config(test_name: &str) -> (PathBuf, String) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut dir = PathBuf::from(".veilid-test");
+        dir.push(format!("{}-{}", test_name, timestamp));
+        // Create unique namespace - this is critical for Veilid's global INITIALIZED HashSet
+        let namespace = format!("{}-{}", test_name, timestamp);
+        (dir, namespace)
+    }
+
+    /// Helper function to shutdown blobs instance with proper cleanup delay
+    async fn shutdown_blobs(blobs: VeilidIrohBlobs) {
+        blobs.shutdown().await.unwrap();
+        // Give Veilid time to fully clean up before next test
+        // Veilid needs substantial time to fully release all global resources
+        // Even though shutdown().await completes, internal cleanup continues
+        sleep(Duration::from_secs(5)).await;
+    }
+
     #[tokio::test]
     async fn test_tunnel() {
         //unsafe { backtrace_on_stack_overflow::enable() }
 
-        let mut base_dir = PathBuf::new();
-        base_dir.push(".veilid");
+        // Use unique namespace to prevent conflicts
+        let (base_dir, namespace) = get_test_config("test_tunnel");
 
         /* four threads
         veilid cb -> updates channel
@@ -53,7 +76,7 @@ mod tests {
         let read_update2 = send_update.subscribe();
 
         let (veilid, mut rx) =
-            crate::init_veilid(Some("tunnels_test_1".to_string()), &base_dir.join("peer1"))
+            crate::init_veilid(Some(namespace), &base_dir)
                 .await
                 .expect("Unable to init veilid and store");
 
@@ -164,7 +187,8 @@ mod tests {
                 listening.listen(read_update2).await.unwrap();
             });
 
-            sleep(Duration::from_secs(10)).await;
+            // Wait longer for network to stabilize before opening tunnel
+            sleep(Duration::from_secs(15)).await;
 
             let result = tunnels2.open(route_id1_blob).await;
 
@@ -178,7 +202,7 @@ mod tests {
 
             let (sender, mut reader) = result.unwrap();
 
-            // STart reading so the chanel isn't marked as closed
+            // Start reading so the channel isn't marked as closed
             let read_result = reader.recv();
             let result = sender.send("Hello World!".as_bytes().to_vec()).await;
 
@@ -194,27 +218,36 @@ mod tests {
                 .await
                 .unwrap();
 
-            let result = read_result.await;
+            // Add timeout for network reads to distinguish timeouts from other failures
+            let result = tokio::time::timeout(Duration::from_secs(30), read_result).await;
 
-            if result.is_none() {
-                send_result2
-                    .send(Err(anyhow!("Unable to read first message")))
-                    .await
-                    .unwrap();
-                return;
-            }
+            match result {
+                Err(_) => {
+                    send_result2
+                        .send(Err(anyhow!("Timeout waiting for tunnel response (network timing issue)")))
+                        .await
+                        .unwrap();
+                    return;
+                }
+                Ok(None) => {
+                    send_result2
+                        .send(Err(anyhow!("Tunnel closed before receiving response")))
+                        .await
+                        .unwrap();
+                    return;
+                }
+                Ok(Some(raw)) => {
+                    let message = str::from_utf8(raw.as_slice()).unwrap();
 
-            let raw = result.unwrap();
-
-            let message = str::from_utf8(raw.as_slice()).unwrap();
-
-            if message.eq("Goodbye World!") {
-                send_result2.send(Ok(())).await.unwrap();
-            } else {
-                send_result2
-                    .send(Err(anyhow!("Got invalid message from tunnel {0}", message)))
-                    .await
-                    .unwrap();
+                    if message.eq("Goodbye World!") {
+                        send_result2.send(Ok(())).await.unwrap();
+                    } else {
+                        send_result2
+                            .send(Err(anyhow!("Got invalid message from tunnel {0}", message)))
+                            .await
+                            .unwrap();
+                    }
+                }
             }
         });
 
@@ -232,10 +265,11 @@ mod tests {
         tunnel1_handle.abort();
         tunnel2_handle.abort();
         veilid.shutdown().await;
+        sleep(Duration::from_secs(3)).await;
     }
 
     #[tokio::test]
-    async fn test_tunnel_route_reset() {
+    async fn test_route_reset() {
         //unsafe { backtrace_on_stack_overflow::enable() }
 
         let mut base_dir = PathBuf::new();
@@ -310,10 +344,9 @@ mod tests {
     async fn test_blobs() {
         //unsafe { backtrace_on_stack_overflow::enable() }
 
-        let mut base_dir = PathBuf::new();
-        base_dir.push(".veilid");
+        let (base_dir, namespace) = get_test_config("test_blobs");
 
-        let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        let blobs = VeilidIrohBlobs::from_directory(&base_dir, Some(namespace), None, None)
             .await
             .unwrap();
 
@@ -336,14 +369,15 @@ mod tests {
 
         println!("Blobs has hash: {}", has);
 
-        blobs.shutdown().await.unwrap();
+        shutdown_blobs(blobs).await;
     }
 
     #[tokio::test]
     async fn test_blob_replication() {
         let mut base_dir = PathBuf::new();
         base_dir.push(".veilid");
-        let (veilid, mut rx) = crate::init_veilid(None, &base_dir).await.unwrap();
+        let replication_dir = base_dir.join("replication");
+        let (veilid, mut rx) = crate::init_veilid(Some("blob_replication_test".to_string()), &replication_dir).await.unwrap();
 
         let (send_update, read_update) = broadcast::channel::<VeilidUpdate>(256);
         let read_update1 = read_update;
@@ -365,14 +399,12 @@ mod tests {
         let v1 = veilid.clone();
         let v2 = veilid.clone();
 
-        let mut store1_dir = base_dir.clone();
-        store1_dir.push("peer1");
+        let store1_dir = replication_dir.join("peer1");
         let store1 = iroh_blobs::store::fs::Store::load(store1_dir)
             .await
             .unwrap();
 
-        let mut store2_dir = base_dir.clone();
-        store2_dir.push("peer2");
+        let store2_dir = replication_dir.join("peer2");
         let store2 = iroh_blobs::store::fs::Store::load(store2_dir)
             .await
             .unwrap();
@@ -383,26 +415,26 @@ mod tests {
         let router2 = v2.routing_context().unwrap();
         let (route_id2, route_id2_blob) = crate::make_route(&v2).await.unwrap();
 
-        let blobs1 = VeilidIrohBlobs::new(
-            v1,
-            router1,
-            route_id1_blob,
-            route_id1,
-            read_update1,
-            store1,
-            None,
-            None,
-        );
-        let blobs2 = VeilidIrohBlobs::new(
-            v2,
-            router2,
-            route_id2_blob,
-            route_id2,
-            read_update2,
-            store2,
-            None,
-            None,
-        );
+        let blobs1 = VeilidIrohBlobs::new(VeilidIrohBlobsConfig {
+            veilid: v1,
+            router: router1,
+            route_id_blob: route_id1_blob,
+            route_id: route_id1,
+            updates: read_update1,
+            store: store1,
+            on_route_disconnected_callback: None,
+            on_new_route_callback: None,
+        });
+        let blobs2 = VeilidIrohBlobs::new(VeilidIrohBlobsConfig {
+            veilid: v2,
+            router: router2,
+            route_id_blob: route_id2_blob,
+            route_id: route_id2,
+            updates: read_update2,
+            store: store2,
+            on_route_disconnected_callback: None,
+            on_new_route_callback: None,
+        });
 
         let hash = blobs1
             .upload_from_path(std::fs::canonicalize(Path::new("./README.md")).unwrap())
@@ -419,18 +451,22 @@ mod tests {
         assert!(has, "Blobs has hash after download");
 
         sender_handle.abort();
+        // Shutdown both blobs instances - blobs2 must be shut down first since it shares the veilid instance
+        blobs2.shutdown().await.unwrap();
+        blobs1.shutdown().await.unwrap();
+        // Give Veilid time to fully clean up
+        sleep(Duration::from_secs(5)).await;
     }
 
     #[tokio::test]
     async fn test_create_collection() {
-        let mut base_dir = PathBuf::new();
-        base_dir.push(".veilid");
+        let (base_dir, namespace) = get_test_config("test_create_collection");
 
         // Log: Initializing blobs instance
         println!("Initializing blobs instance from directory: {:?}", base_dir);
 
         // Initialize the blobs instance
-        let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        let blobs = VeilidIrohBlobs::from_directory(&base_dir, Some(namespace), None, None)
             .await
             .unwrap();
 
@@ -460,15 +496,14 @@ mod tests {
         );
 
         // Clean up by shutting down blobs instance
-        blobs.shutdown().await.unwrap();
+        shutdown_blobs(blobs).await;
     }
     #[tokio::test]
     async fn test_collection_operations() {
-        let mut base_dir = PathBuf::new();
-        base_dir.push(".veilid");
+        let (base_dir, namespace) = get_test_config("test_collection_operations");
 
         // Initialize the blobs instance
-        let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        let blobs = VeilidIrohBlobs::from_directory(&base_dir, Some(namespace), None, None)
             .await
             .unwrap();
 
@@ -585,14 +620,13 @@ mod tests {
         );
 
         // Clean up by shutting down blobs instance
-        blobs.shutdown().await.unwrap();
+        shutdown_blobs(blobs).await;
     }
     #[tokio::test]
     async fn test_set_file() {
-        let mut base_dir = PathBuf::new();
-        base_dir.push(".veilid");
+        let (base_dir, namespace) = get_test_config("test_set_file");
 
-        let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        let blobs = VeilidIrohBlobs::from_directory(&base_dir, Some(namespace), None, None)
             .await
             .unwrap();
 
@@ -645,14 +679,13 @@ mod tests {
             "Updated collection hash should not be empty"
         );
 
-        blobs.shutdown().await.unwrap();
+        shutdown_blobs(blobs).await;
     }
     #[tokio::test]
     async fn test_get_file() {
-        let mut base_dir = PathBuf::new();
-        base_dir.push(".veilid");
+        let (base_dir, namespace) = get_test_config("test_get_file");
 
-        let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        let blobs = VeilidIrohBlobs::from_directory(&base_dir, Some(namespace), None, None)
             .await
             .unwrap();
 
@@ -685,14 +718,13 @@ mod tests {
             "The file hash should match the uploaded file hash"
         );
 
-        blobs.shutdown().await.unwrap();
+        shutdown_blobs(blobs).await;
     }
     #[tokio::test]
     async fn test_delete_file() {
-        let mut base_dir = PathBuf::new();
-        base_dir.push(".veilid");
+        let (base_dir, namespace) = get_test_config("test_delete_file");
 
-        let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        let blobs = VeilidIrohBlobs::from_directory(&base_dir, Some(namespace), None, None)
             .await
             .unwrap();
 
@@ -725,14 +757,13 @@ mod tests {
             "New collection hash after deletion should not be empty"
         );
 
-        blobs.shutdown().await.unwrap();
+        shutdown_blobs(blobs).await;
     }
     #[tokio::test]
     async fn test_list_files() {
-        let mut base_dir = PathBuf::new();
-        base_dir.push(".veilid");
+        let (base_dir, namespace) = get_test_config("test_list_files");
 
-        let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        let blobs = VeilidIrohBlobs::from_directory(&base_dir, Some(namespace), None, None)
             .await
             .unwrap();
 
@@ -767,14 +798,13 @@ mod tests {
             "The file path should match the uploaded file path"
         );
 
-        blobs.shutdown().await.unwrap();
+        shutdown_blobs(blobs).await;
     }
     #[tokio::test]
     async fn test_collection_hash() {
-        let mut base_dir = PathBuf::new();
-        base_dir.push(".veilid");
+        let (base_dir, namespace) = get_test_config("test_collection_hash");
 
-        let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        let blobs = VeilidIrohBlobs::from_directory(&base_dir, Some(namespace), None, None)
             .await
             .unwrap();
 
@@ -792,14 +822,13 @@ mod tests {
             "The retrieved collection hash should match the created collection hash"
         );
 
-        blobs.shutdown().await.unwrap();
+        shutdown_blobs(blobs).await;
     }
     #[tokio::test]
     async fn test_upload_to() {
-        let mut base_dir = PathBuf::new();
-        base_dir.push(".veilid");
+        let (base_dir, namespace) = get_test_config("test_upload_to");
 
-        let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        let blobs = VeilidIrohBlobs::from_directory(&base_dir, Some(namespace), None, None)
             .await
             .unwrap();
 
@@ -809,12 +838,6 @@ mod tests {
             .create_collection(&collection_name.clone())
             .await
             .unwrap();
-
-        // Create a temporary file to upload
-        let file_path = "uploaded_file.txt".to_string();
-        let temp_file_path = base_dir.join("uploaded_file.txt");
-        std::fs::write(&temp_file_path, "test file content for upload_to").unwrap();
-        let absolute_temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
 
         // Create a file stream using mpsc
         let (sender, receiver) = mpsc::channel(1);
@@ -842,15 +865,14 @@ mod tests {
             "New collection hash after uploading a file should not be empty"
         );
 
-        blobs.shutdown().await.unwrap();
+        shutdown_blobs(blobs).await;
     }
 
     #[tokio::test]
     async fn test_missing_collection() {
-        let mut base_dir = PathBuf::new();
-        base_dir.push(".veilid");
+        let (base_dir, namespace) = get_test_config("test_missing_collection");
 
-        let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        let blobs = VeilidIrohBlobs::from_directory(&base_dir, Some(namespace), None, None)
             .await
             .unwrap();
 
@@ -874,14 +896,15 @@ mod tests {
             result.is_err(),
             "Listing files from non-existent collection should fail"
         );
+
+        shutdown_blobs(blobs).await;
     }
 
     #[tokio::test]
     async fn test_overwrite_file() {
-        let mut base_dir = PathBuf::new();
-        base_dir.push(".veilid");
+        let (base_dir, namespace) = get_test_config("test_overwrite_file");
 
-        let blobs = VeilidIrohBlobs::from_directory(&base_dir, None, None, None)
+        let blobs = VeilidIrohBlobs::from_directory(&base_dir, Some(namespace), None, None)
             .await
             .unwrap();
         let collection_name = "my_test_collection".to_string();
@@ -926,12 +949,14 @@ mod tests {
             new_file_hash, retrieved_file_hash,
             "The file hash should be updated after overwrite"
         );
+
+        shutdown_blobs(blobs).await;
     }
 }
 
 async fn init_veilid(
     namespace: Option<String>,
-    base_dir: &PathBuf,
+    base_dir: &Path,
 ) -> Result<(VeilidAPI, Receiver<VeilidUpdate>)> {
     let config_inner = config_for_dir(base_dir.to_path_buf(), namespace);
 
@@ -972,7 +997,7 @@ async fn init_veilid(
 
 async fn init_deps(
     namespace: Option<String>,
-    base_dir: &PathBuf,
+    base_dir: &Path,
 ) -> Result<(
     VeilidAPI,
     Receiver<VeilidUpdate>,
@@ -1005,9 +1030,9 @@ async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
     Err(anyhow!("Unable to create route, reached max retries"))
 }
 
-fn config_for_dir(base_dir: PathBuf, namespace: Option<String>) -> VeilidConfigInner {
-    let namespace: String = namespace.unwrap_or("iroh-blobs".to_string());
-    return VeilidConfigInner {
+fn config_for_dir(base_dir: PathBuf, namespace: Option<String>) -> VeilidConfig {
+    let namespace: String = namespace.unwrap_or_else(|| "iroh-blobs".to_string());
+    VeilidConfig {
         program_name: "iroh-blobs".to_string(),
         namespace,
         protected_store: veilid_core::VeilidConfigProtectedStore {
@@ -1028,5 +1053,5 @@ fn config_for_dir(base_dir: PathBuf, namespace: Option<String>) -> VeilidConfigI
             ..Default::default()
         },
         ..Default::default()
-    };
+    }
 }
