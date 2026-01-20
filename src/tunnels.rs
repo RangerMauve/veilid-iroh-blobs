@@ -4,7 +4,6 @@ use bytes::BufMut;
 use bytes::Bytes;
 use bytes::BytesMut;
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
@@ -14,7 +13,7 @@ use veilid_core::OperationId;
 use veilid_core::VeilidAPI;
 use veilid_core::VeilidAppCall;
 use veilid_core::VALID_CRYPTO_KINDS;
-use veilid_core::{RouteId, RoutingContext, Target, VeilidUpdate, CRYPTO_KEY_LENGTH};
+use veilid_core::{RouteId, RoutingContext, Target, VeilidUpdate};
 
 pub type Tunnel = (Sender<Vec<u8>>, Receiver<Vec<u8>>);
 pub type TunnelId = (RouteId, u32);
@@ -72,11 +71,12 @@ impl TunnelManagerInner {
     }
 
     async fn send_bytes(&self, id: &TunnelId, bytes: Vec<u8>) -> Result<()> {
-        let mut buffer: BytesMut = BytesMut::with_capacity(bytes.len() + 4 + CRYPTO_KEY_LENGTH);
-        buffer.put(self.route_id.bytes.to_vec().as_slice());
+        let route_id_bytes = Vec::from(self.route_id.clone());
+        let mut buffer: BytesMut = BytesMut::with_capacity(bytes.len() + 4 + route_id_bytes.len());
+        buffer.put(route_id_bytes.as_slice());
         buffer.put_u32(id.1);
         buffer.put(bytes.as_slice());
-        let target = Target::PrivateRoute(id.0);
+        let target = Target::RouteId(id.0.clone());
         let result = self.router.app_call(target, buffer.to_vec()).await?;
 
         if result.len() != 1 {
@@ -132,7 +132,7 @@ impl TunnelManagerInner {
             }
             // TODO: Better error handling?
             let (route_id, route_id_blob) = make_route(&self.veilid).await.unwrap();
-            self.route_id = route_id;
+            self.route_id = route_id.clone();
             self.route_id_blob = route_id_blob.clone();
             if let Some(callback) = &self.on_new_route_callback {
                 callback(route_id, route_id_blob);
@@ -150,11 +150,11 @@ impl TunnelManager {
         {
             let mut inner = self.inner.lock().await;
 
-            inner.senders.insert(*id, man_to_tun);
+            inner.senders.insert(id.clone(), man_to_tun);
         }
 
         let inner = self.inner.clone();
-        let id = *id;
+        let id = id.clone();
         let route_id = self.route_id().await;
 
         tokio::spawn(async move {
@@ -250,18 +250,19 @@ impl TunnelManager {
 
         let mut buffer = Bytes::copy_from_slice(app_call.message());
 
-        // THis is all to read 32 bytes into a fixed buffer 💀
-        let route_id_buffer = buffer.get(0..32);
+        // Read route_id bytes (variable length based on crypto kind)
+        let current_route_id = self.route_id().await;
+        let route_id_len = Vec::from(current_route_id).len();
+        let route_id_buffer = buffer.get(0..route_id_len);
         if route_id_buffer.is_none() {
             return Ok(());
         }
         let route_id_buffer = route_id_buffer.unwrap();
-        let mut route_key_raw: [u8; CRYPTO_KEY_LENGTH] = [0; CRYPTO_KEY_LENGTH];
-        route_key_raw.writer().write_all(route_id_buffer)?;
-        let route_key = RouteId { bytes: route_key_raw };
+        let route_key = RouteId::try_from(route_id_buffer.to_vec())
+            .map_err(|e| anyhow!("Failed to parse RouteId: {}", e))?;
 
         // Apparently .get(index) doesn't advance the buffer 🤷
-        buffer.advance(32);
+        buffer.advance(route_id_len);
 
         let tunnel_number = buffer.get_u32();
         let bytes = buffer.chunk();
@@ -298,7 +299,9 @@ impl TunnelManager {
         on_new_route_callback: Option<OnNewRouteCallback>,
     ) -> Result<Self> {
         let router = veilid.routing_context()?;
-        let (route_id, route_id_blob) = veilid.new_private_route().await?;
+        let route_blob = veilid.new_private_route().await?;
+        let route_id = route_blob.route_id;
+        let route_id_blob = route_blob.blob;
 
         Ok(Self::new(
             veilid,
@@ -341,7 +344,7 @@ impl TunnelManager {
     pub async fn route_id(&self) -> RouteId {
         let inner = self.inner.lock().await;
 
-        inner.route_id
+        inner.route_id.clone()
     }
 
     pub async fn route_id_blob(&self) -> Vec<u8> {
@@ -413,8 +416,8 @@ async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
             )
             .await;
 
-        if let Ok(route) = result {
-            return Ok(route);
+        if let Ok(route_blob) = result {
+            return Ok((route_blob.route_id, route_blob.blob));
         }
     }
     Err(anyhow!("Unable to create route, reached max retries"))

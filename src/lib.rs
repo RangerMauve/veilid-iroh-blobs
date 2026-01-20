@@ -313,7 +313,7 @@ mod tests {
         let tunnels = crate::tunnels::TunnelManager::new(
             veilid.clone(),
             router,
-            route_id,
+            route_id.clone(),
             route_id_blob,
             None,
             Some(on_disconnected),
@@ -973,7 +973,7 @@ async fn init_veilid(
     });
 
     println!("Init veilid");
-    let veilid = veilid_core::api_startup_config(update_callback, config_inner).await?;
+    let veilid = veilid_core::api_startup(update_callback, config_inner).await?;
 
     println!("Attach veilid");
 
@@ -1023,8 +1023,8 @@ async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
             )
             .await;
 
-        if let Ok(route) = result {
-            return Ok(route);
+        if let Ok(route_blob) = result {
+            return Ok((route_blob.route_id, route_blob.blob));
         }
     }
     Err(anyhow!("Unable to create route, reached max retries"))
