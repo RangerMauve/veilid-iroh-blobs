@@ -134,10 +134,18 @@ impl VeilidIrohBlobs {
         let listening_blobs = blobs.clone();
 
         let tunnels_handle = tokio::spawn(async move {
-            listening.listen(updates).await.unwrap();
+            if let Err(err) = listening.listen(updates).await {
+                eprintln!("TunnelManager listen failed: {err}");
+                // Also log via tracing if subscriber is configured
+                tracing::error!("TunnelManager listen failed: {err}");
+            }
         });
         let blobs_handle = tokio::spawn(async move {
-            listening_blobs.listen(read_tunnel).await.unwrap();
+            if let Err(err) = listening_blobs.listen(read_tunnel).await {
+                eprintln!("VeilidIrohBlobs listen failed: {err}");
+                // Also log via tracing if subscriber is configured
+                tracing::error!("VeilidIrohBlobs listen failed: {err}");
+            }
         });
 
         let mut handles = handles.lock().unwrap();

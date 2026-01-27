@@ -272,8 +272,7 @@ mod tests {
     async fn test_route_reset() {
         //unsafe { backtrace_on_stack_overflow::enable() }
 
-        let mut base_dir = PathBuf::new();
-        base_dir.push(".veilid");
+        let (base_dir, namespace) = get_test_config("test_route_reset");
 
         let (send_update, read_update) = broadcast::channel::<VeilidUpdate>(256);
         let (send_result, mut read_result) = mpsc::channel::<Result<()>>(2);
@@ -281,7 +280,7 @@ mod tests {
         let send_result1 = send_result.clone();
         let send_result2 = send_result.clone();
 
-        let (veilid, mut rx) = crate::init_veilid(Some("tunnels_test".to_string()), &base_dir)
+        let (veilid, mut rx) = crate::init_veilid(Some(namespace), &base_dir)
             .await
             .expect("Unable to init veilid and store");
 
@@ -374,10 +373,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_replication() {
-        let mut base_dir = PathBuf::new();
-        base_dir.push(".veilid");
-        let replication_dir = base_dir.join("replication");
-        let (veilid, mut rx) = crate::init_veilid(Some("blob_replication_test".to_string()), &replication_dir).await.unwrap();
+        let (base_dir, namespace) = get_test_config("test_blob_replication");
+        let (veilid, mut rx) = crate::init_veilid(Some(namespace), &base_dir).await.unwrap();
 
         let (send_update, read_update) = broadcast::channel::<VeilidUpdate>(256);
         let read_update1 = read_update;
@@ -399,12 +396,12 @@ mod tests {
         let v1 = veilid.clone();
         let v2 = veilid.clone();
 
-        let store1_dir = replication_dir.join("peer1");
+        let store1_dir = base_dir.join("peer1");
         let store1 = iroh_blobs::store::fs::Store::load(store1_dir)
             .await
             .unwrap();
 
-        let store2_dir = replication_dir.join("peer2");
+        let store2_dir = base_dir.join("peer2");
         let store2 = iroh_blobs::store::fs::Store::load(store2_dir)
             .await
             .unwrap();
