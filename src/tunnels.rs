@@ -40,7 +40,7 @@ impl TryFrom<u8> for TunnelResult {
             x if x == TunnelResult::Success as u8 => Ok(TunnelResult::Success),
             x if x == TunnelResult::InvalidFormat as u8 => Ok(TunnelResult::InvalidFormat),
             x if x == TunnelResult::Closed as u8 => Ok(TunnelResult::Closed),
-            _ => Err(anyhow!("Invalid tunnel result value {:?}", v)),
+            _ => Err(anyhow!("Invalid tunnel result value {v:?}")),
         }
     }
 }
@@ -81,8 +81,7 @@ impl TunnelManagerInner {
 
         if result.len() != 1 {
             return Err(anyhow!(
-                "Got invalid response length from app call: {:?}",
-                result
+                "Got invalid response length from app call: {result:?}"
             ));
         }
 
@@ -105,7 +104,7 @@ impl TunnelManagerInner {
             .unwrap()
             .send(bytes.to_vec())
             .await
-            .map_err(|err| anyhow!("Unable to send: {}", err))
+            .map_err(|err| anyhow!("Unable to send: {err}"))
     }
 
     async fn handle_remote_dead(&mut self, routes: &[RouteId]) {
@@ -180,9 +179,7 @@ impl TunnelManager {
         let ping = &message[0..PING_BYTES.len()];
         if !ping.eq(PING_BYTES) {
             return Err(anyhow!(
-                "Got invalid length for ping: {:?}\n Expected: {:?}",
-                ping,
-                PING_BYTES
+                "Got invalid length for ping: {ping:?}\n Expected: {PING_BYTES:?}"
             ));
         }
 
@@ -259,7 +256,7 @@ impl TunnelManager {
         }
         let route_id_buffer = route_id_buffer.unwrap();
         let route_key = RouteId::try_from(route_id_buffer.to_vec())
-            .map_err(|e| anyhow!("Failed to parse RouteId: {}", e))?;
+            .map_err(|e| anyhow!("Failed to parse RouteId: {e}"))?;
 
         // Apparently .get(index) doesn't advance the buffer 🤷
         buffer.advance(route_id_len);

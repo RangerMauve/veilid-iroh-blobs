@@ -288,7 +288,7 @@ impl VeilidIrohBlobs {
         } else if command == NO {
             Ok(false)
         } else {
-            Err(anyhow!("Invalid response code from peer {:?}", command))
+            Err(anyhow!("Invalid response code from peer {command:?}"))
         }
     }
 
@@ -378,7 +378,7 @@ impl VeilidIrohBlobs {
         } else if command == NO {
             return Err(anyhow!("Peer does not have hash"));
         } else {
-            return Err(anyhow!("Invalid response code from peer {:?}", command));
+            return Err(anyhow!("Invalid response code from peer {command:?}"));
         }
     }
 
@@ -495,7 +495,7 @@ impl VeilidIrohBlobs {
         let collection_hash = self.collection_hash(collection_name).await?;
         let collection_data = self.read_bytes(collection_hash).await?;
         let collection: FileCollection = from_slice(&collection_data)
-            .map_err(|err| anyhow!("Failed to deserialize collection: {:?}", err))?;
+            .map_err(|err| anyhow!("Failed to deserialize collection: {err:?}"))?;
 
         Ok(collection)
     }
@@ -587,7 +587,7 @@ impl VeilidIrohBlobs {
         collection
             .get(path)
             .cloned()
-            .ok_or_else(|| anyhow!("File not found for path: {}", path))
+            .ok_or_else(|| anyhow!("File not found for path: {path}"))
     }
 
     pub async fn delete_file_from_collection_hash(
@@ -614,7 +614,7 @@ impl VeilidIrohBlobs {
     ) -> Result<HashMap<String, Hash>> {
         // Verify the collection exists
         if self.store.get(collection_hash).await?.is_none() {
-            return Err(anyhow!("Collection not found for hash: {}", collection_hash));
+            return Err(anyhow!("Collection not found for hash: {collection_hash}"));
         }
 
         // Read the serialized collection data directly
@@ -622,7 +622,7 @@ impl VeilidIrohBlobs {
 
         // Deserialize the collection into a HashMap
         let collection: HashMap<String, Hash> = from_slice(&collection_data)
-            .map_err(|err| anyhow!("Failed to deserialize collection: {:?}", err))?;
+            .map_err(|err| anyhow!("Failed to deserialize collection: {err:?}"))?;
 
         Ok(collection)
     }
@@ -632,19 +632,18 @@ impl VeilidIrohBlobs {
 
         for tag_result in tags {
             let (tag, hash_and_format) =
-                tag_result.map_err(|e| anyhow!("Error reading tags: {:?}", e))?;
+                tag_result.map_err(|e| anyhow!("Error reading tags: {e:?}"))?;
 
             // Check if the hash matches the provided collection_hash
             if hash_and_format.hash == *collection_hash {
                 // Convert the tag bytes to a String and return it as the collection name
                 return String::from_utf8(tag.0.to_vec())
-                    .map_err(|e| anyhow!("Failed to convert tag to String: {:?}", e));
+                    .map_err(|e| anyhow!("Failed to convert tag to String: {e:?}"));
             }
         }
 
         Err(anyhow!(
-            "Collection name not found for hash: {}",
-            collection_hash
+            "Collection name not found for hash: {collection_hash}"
         ))
     }
 
@@ -689,7 +688,7 @@ impl VeilidIrohBlobs {
 
         for tag_result in tags {
             let (tag, hash_and_format) =
-                tag_result.map_err(|e| anyhow!("Error reading tags: {:?}", e))?;
+                tag_result.map_err(|e| anyhow!("Error reading tags: {e:?}"))?;
 
             // Directly compare tag bytes with collection_name bytes
             if tag.0.as_ref().eq(collection_name_bytes) {
@@ -697,7 +696,7 @@ impl VeilidIrohBlobs {
             }
         }
 
-        Err(anyhow!("Tag not found for collection: {}", collection_name))
+        Err(anyhow!("Tag not found for collection: {collection_name}"))
     }
 
     pub async fn update_collection_with_name(
@@ -738,7 +737,7 @@ impl VeilidIrohBlobs {
     ) -> Result<Hash> {
         // Verify the old collection exists before creating new version
         if self.store.get(collection_hash).await?.is_none() {
-            return Err(anyhow!("Cannot update - collection hash {} not found", collection_hash));
+            return Err(anyhow!("Cannot update - collection hash {collection_hash} not found"));
         }
 
         // Serialize the updated HashMap to CBOR
