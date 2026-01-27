@@ -1,6 +1,6 @@
 [package]
 name = "veilid-iroh-blobs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -19,3 +19,6 @@ tokio-stream = "0.1.15"
 tracing = "0.1.40"
 veilid-core = { git = "https://gitlab.com/veilid/veilid.git", tag = "v0.5.1" }
 hex = "0.4"
+ # Temporary patch for Veilid fanout queue underflow bug
+[patch."https://gitlab.com/veilid/veilid.git"]
+veilid-core = { git = "https://gitlab.com/tripledoublev/veilid.git", branch = "fix-underflow" }
