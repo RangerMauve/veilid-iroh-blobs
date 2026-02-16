@@ -1,6 +1,6 @@
 [package]
 name = "veilid-iroh-blobs"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 
 [dependencies]
@@ -17,8 +17,9 @@ serde_cbor = "0.11.2"
 tokio = {version = "1.38.1", features = ["full", "tracing"]}
 tokio-stream = "0.1.15"
 tracing = "0.1.40"
-veilid-core = { git = "https://gitlab.com/veilid/veilid.git", tag = "v0.5.1" }
+veilid-core = { git = "https://gitlab.com/veilid/veilid.git", tag = "v0.5.2" }
 hex = "0.4"
- # Temporary patch for Veilid fanout queue underflow bug
-[patch."https://gitlab.com/veilid/veilid.git"]
-veilid-core = { git = "https://gitlab.com/tripledoublev/veilid.git", branch = "fix-underflow" }
+
+# Patch iroh-net to relax hickory-resolver pin for veilid-core 0.5.2 compat
+[patch.crates-io]
+iroh-net = { git = "https://github.com/tripledoublev/iroh.git", branch = "relax-hickory" }
