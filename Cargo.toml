@@ -22,4 +22,4 @@ hex = "0.4"
 
 # Patch iroh-net to relax hickory-resolver pin for veilid-core 0.5.2 compat
 [patch.crates-io]
-iroh-net = { git = "https://github.com/tripledoublev/iroh.git", branch = "relax-hickory" }
+iroh-net = { git = "https://github.com/tripledoublev/iroh.git", rev = "b3f52f6d8bba462eebd7e3991946d844c9a75039" }
