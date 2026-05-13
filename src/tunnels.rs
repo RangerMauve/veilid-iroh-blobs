@@ -142,6 +142,25 @@ impl TunnelManagerInner {
 }
 
 impl TunnelManager {
+    fn new_tunnel_route_blob(message: &[u8]) -> Result<&[u8]> {
+        if message.len() < PING_BYTES.len() {
+            return Err(anyhow!(
+                "Invalid new tunnel message length: got {}, expected at least {}",
+                message.len(),
+                PING_BYTES.len()
+            ));
+        }
+
+        let ping = &message[..PING_BYTES.len()];
+        if ping != PING_BYTES {
+            return Err(anyhow!(
+                "Invalid tunnel ping prefix: {ping:?}\n Expected: {PING_BYTES:?}"
+            ));
+        }
+
+        Ok(&message[PING_BYTES.len()..])
+    }
+
     async fn track(&self, id: &TunnelId) -> Result<Tunnel> {
         let (man_to_tun, from_man_to_tun) = mpsc::channel(100);
         let (tun_to_man, mut from_tun_to_man) = mpsc::channel::<Vec<u8>>(100);
@@ -176,14 +195,7 @@ impl TunnelManager {
     }
 
     async fn handle_new(&self, id: &TunnelId, message: &[u8]) -> Result<()> {
-        let ping = &message[0..PING_BYTES.len()];
-        if !ping.eq(PING_BYTES) {
-            return Err(anyhow!(
-                "Got invalid length for ping: {ping:?}\n Expected: {PING_BYTES:?}"
-            ));
-        }
-
-        let route_id_blob = &message[PING_BYTES.len()..];
+        let route_id_blob = Self::new_tunnel_route_blob(message)?;
 
         let route_id = self
             .veilid
@@ -221,6 +233,7 @@ impl TunnelManager {
                     self.route_id().await,
                     err
                 );
+                return Err(err);
             }
         } else if let Err(err) = self.handle_new(id, message).await {
             eprintln!(
@@ -228,6 +241,7 @@ impl TunnelManager {
                 self.route_id().await,
                 err
             );
+            return Err(err);
         }
 
         Ok(())
@@ -252,14 +266,29 @@ impl TunnelManager {
         let route_id_len = Vec::from(current_route_id).len();
         let route_id_buffer = buffer.get(0..route_id_len);
         if route_id_buffer.is_none() {
-            return Ok(());
+            return self
+                .app_call_reply(call_id, TunnelResult::InvalidFormat)
+                .await;
         }
         let route_id_buffer = route_id_buffer.unwrap();
-        let route_key = RouteId::try_from(route_id_buffer.to_vec())
-            .map_err(|e| anyhow!("Failed to parse RouteId: {e}"))?;
+        let route_key = match RouteId::try_from(route_id_buffer.to_vec()) {
+            Ok(route_key) => route_key,
+            Err(err) => {
+                eprintln!("Failed to parse tunnel route id: {err}");
+                return self
+                    .app_call_reply(call_id, TunnelResult::InvalidFormat)
+                    .await;
+            }
+        };
 
         // Apparently .get(index) doesn't advance the buffer 🤷
         buffer.advance(route_id_len);
+
+        if buffer.remaining() < std::mem::size_of::<u32>() {
+            return self
+                .app_call_reply(call_id, TunnelResult::InvalidFormat)
+                .await;
+        }
 
         let tunnel_number = buffer.get_u32();
         let bytes = buffer.chunk();
@@ -268,7 +297,10 @@ impl TunnelManager {
 
         match self.handle_message(&id, bytes).await {
             Ok(_) => self.app_call_reply(call_id, TunnelResult::Success).await,
-            Err(_) => self.app_call_reply(call_id, TunnelResult::Closed).await,
+            Err(_) => {
+                self.app_call_reply(call_id, TunnelResult::InvalidFormat)
+                    .await
+            }
         }
     }
 
@@ -418,4 +450,43 @@ async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
         }
     }
     Err(anyhow!("Unable to create route, reached max retries"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_tunnel_route_blob_rejects_short_messages() {
+        let err = TunnelManager::new_tunnel_route_blob(&[TunnelResult::InvalidFormat as u8])
+            .expect_err("short new-tunnel messages should be rejected, not sliced");
+
+        assert!(
+            err.to_string()
+                .contains("Invalid new tunnel message length"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn new_tunnel_route_blob_rejects_invalid_ping_prefix() {
+        let err = TunnelManager::new_tunnel_route_blob(&[0, 0, 0, 0, 1, 2, 3])
+            .expect_err("messages with the wrong ping prefix should be rejected");
+
+        assert!(
+            err.to_string().contains("Invalid tunnel ping prefix"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn new_tunnel_route_blob_returns_route_blob_after_ping() {
+        let mut message = PING_BYTES.to_vec();
+        message.extend([1, 2, 3]);
+
+        let route_blob = TunnelManager::new_tunnel_route_blob(&message)
+            .expect("valid ping prefix should return the remaining route blob");
+
+        assert_eq!(route_blob, &[1, 2, 3]);
+    }
 }
