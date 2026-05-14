@@ -458,7 +458,7 @@ mod tests {
 
     #[test]
     fn new_tunnel_route_blob_rejects_short_messages() {
-        let err = TunnelManager::new_tunnel_route_blob(&[TunnelResult::InvalidFormat as u8])
+        let err = TunnelManager::new_tunnel_route_blob(&[99])
             .expect_err("short new-tunnel messages should be rejected, not sliced");
 
         assert!(
@@ -480,6 +480,14 @@ mod tests {
     }
 
     #[test]
+    fn new_tunnel_route_blob_returns_empty_slice_when_only_ping() {
+        let route_blob = TunnelManager::new_tunnel_route_blob(PING_BYTES)
+            .expect("message with only ping prefix should return empty slice");
+
+        assert!(route_blob.is_empty());
+    }
+
+    #[test]
     fn new_tunnel_route_blob_returns_route_blob_after_ping() {
         let mut message = PING_BYTES.to_vec();
         message.extend([1, 2, 3]);
@@ -488,5 +496,17 @@ mod tests {
             .expect("valid ping prefix should return the remaining route blob");
 
         assert_eq!(route_blob, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn new_tunnel_route_blob_handles_large_payloads() {
+        let mut message = PING_BYTES.to_vec();
+        message.extend(vec![42u8; 1024]);
+
+        let route_blob = TunnelManager::new_tunnel_route_blob(&message)
+            .expect("large payloads should be parsed correctly");
+
+        assert_eq!(route_blob.len(), 1024);
+        assert!(route_blob.iter().all(|b| *b == 42u8));
     }
 }
