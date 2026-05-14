@@ -13,7 +13,6 @@ use tracing::error;
 use veilid_core::OperationId;
 use veilid_core::VeilidAPI;
 use veilid_core::VeilidAppCall;
-use veilid_core::VALID_CRYPTO_KINDS;
 use veilid_core::{RouteId, RoutingContext, Target, VeilidUpdate};
 
 pub type Tunnel = (Sender<Vec<u8>>, Receiver<Vec<u8>>);
@@ -136,7 +135,7 @@ impl TunnelManagerInner {
                 }
             }
             // TODO: Better error handling?
-            let (route_id, route_id_blob) = make_route(&self.veilid).await.unwrap();
+            let (route_id, route_id_blob) = crate::make_route(&self.veilid).await.unwrap();
             self.route_id = route_id.clone();
             self.route_id_blob = route_id_blob.clone();
             if let Some(callback) = &self.on_new_route_callback {
@@ -329,7 +328,14 @@ impl TunnelManager {
         on_new_route_callback: Option<OnNewRouteCallback>,
     ) -> Result<Self> {
         let router = veilid.routing_context()?;
-        let route_blob = veilid.new_private_route().await?;
+        let route_blob = veilid
+            .new_custom_private_route(veilid_core::PrivateSpec {
+                crypto_kinds: veilid_core::VALID_CRYPTO_KINDS.to_vec(),
+                hop_count: 0,
+                stability: veilid_core::Stability::LowLatency,
+                sequencing: veilid_core::Sequencing::NoPreference,
+            })
+            .await?;
         let route_id = route_blob.route_id;
         let route_id_blob = route_blob.blob;
 
@@ -410,7 +416,9 @@ impl TunnelManager {
     ) -> Result<()> {
         while let Ok(update) = updates.recv().await {
             if let VeilidUpdate::AppCall(app_call) = update {
-                self.handle_app_call(&app_call).await?;
+                if let Err(err) = self.handle_app_call(&app_call).await {
+                    error!(error = ?err, "Error handling AppCall");
+                }
             } else if let VeilidUpdate::RouteChange(route_change) = update {
                 if !route_change.dead_remote_routes.is_empty() {
                     self.handle_remote_dead(&route_change.dead_remote_routes)
@@ -431,26 +439,6 @@ impl TunnelManager {
         self.veilid.shutdown().await;
         Ok(())
     }
-}
-
-// TODO: Put these into a utils module or something
-async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
-    let mut retries = 3;
-    while retries != 0 {
-        retries -= 1;
-        let result = veilid
-            .new_custom_private_route(
-                &VALID_CRYPTO_KINDS,
-                veilid_core::Stability::LowLatency,
-                veilid_core::Sequencing::NoPreference,
-            )
-            .await;
-
-        if let Ok(route_blob) = result {
-            return Ok((route_blob.route_id, route_blob.blob));
-        }
-    }
-    Err(anyhow!("Unable to create route, reached max retries"))
 }
 
 #[cfg(test)]

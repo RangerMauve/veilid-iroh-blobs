@@ -1,5 +1,4 @@
 #![recursion_limit = "256"]
-use anyhow::anyhow;
 use anyhow::Result;
 use std::{
     path::{Path, PathBuf},
@@ -7,12 +6,13 @@ use std::{
 };
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::Receiver;
-use veilid_core::{
-    RouteId, UpdateCallback, VeilidAPI, VeilidConfig, VeilidUpdate, VALID_CRYPTO_KINDS,
-};
+use veilid_core::{UpdateCallback, VeilidAPI, VeilidConfig, VeilidUpdate};
 
 pub mod iroh;
 pub mod tunnels;
+pub mod util;
+
+pub use util::make_route;
 
 async fn init_veilid(
     namespace: Option<String>,
@@ -68,26 +68,6 @@ async fn init_deps(
     let (veilid, rx) = init_veilid(namespace, base_dir).await?;
 
     Ok((veilid, rx, store))
-}
-
-// TODO: Put these into a utils module or something
-async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
-    let mut retries = 3;
-    while retries != 0 {
-        retries -= 1;
-        let result = veilid
-            .new_custom_private_route(
-                &VALID_CRYPTO_KINDS,
-                veilid_core::Stability::LowLatency,
-                veilid_core::Sequencing::NoPreference,
-            )
-            .await;
-
-        if let Ok(route_blob) = result {
-            return Ok((route_blob.route_id, route_blob.blob));
-        }
-    }
-    Err(anyhow!("Unable to create route, reached max retries"))
 }
 
 fn config_for_dir(base_dir: PathBuf, namespace: Option<String>) -> VeilidConfig {
