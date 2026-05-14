@@ -27,7 +27,10 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::Mutex;
 use std::time::Duration;
-use std::{path::{Path, PathBuf}, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -737,7 +740,9 @@ impl VeilidIrohBlobs {
     ) -> Result<Hash> {
         // Verify the old collection exists before creating new version
         if self.store.get(collection_hash).await?.is_none() {
-            return Err(anyhow!("Cannot update - collection hash {collection_hash} not found"));
+            return Err(anyhow!(
+                "Cannot update - collection hash {collection_hash} not found"
+            ));
         }
 
         // Serialize the updated HashMap to CBOR

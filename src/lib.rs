@@ -1,7 +1,10 @@
 #![recursion_limit = "256"]
 use anyhow::anyhow;
 use anyhow::Result;
-use std::{path::{Path, PathBuf}, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::Receiver;
 use veilid_core::{
@@ -10,6 +13,108 @@ use veilid_core::{
 
 pub mod iroh;
 pub mod tunnels;
+
+async fn init_veilid(
+    namespace: Option<String>,
+    base_dir: &Path,
+) -> Result<(VeilidAPI, Receiver<VeilidUpdate>)> {
+    let config_inner = config_for_dir(base_dir.to_path_buf(), namespace);
+
+    let (tx, mut rx) = broadcast::channel(32);
+
+    let update_callback: UpdateCallback = Arc::new(move |update| {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if tx.send(update).is_err() {
+                // TODO:
+                println!("receiver dropped");
+            }
+        });
+    });
+
+    println!("Init veilid");
+    let veilid = veilid_core::api_startup(update_callback, config_inner).await?;
+
+    println!("Attach veilid");
+
+    veilid.attach().await?;
+
+    println!("Wait for veilid network");
+
+    while let Ok(update) = rx.recv().await {
+        if let VeilidUpdate::Attachment(attachment_state) = update {
+            if attachment_state.public_internet_ready && attachment_state.state.is_attached() {
+                println!("Public internet ready!");
+                break;
+            }
+        }
+    }
+
+    println!("Network ready");
+
+    Ok((veilid, rx))
+}
+
+async fn init_deps(
+    namespace: Option<String>,
+    base_dir: &Path,
+) -> Result<(
+    VeilidAPI,
+    Receiver<VeilidUpdate>,
+    iroh_blobs::store::fs::Store,
+)> {
+    let store = iroh_blobs::store::fs::Store::load(base_dir.join("iroh")).await?;
+
+    let (veilid, rx) = init_veilid(namespace, base_dir).await?;
+
+    Ok((veilid, rx, store))
+}
+
+// TODO: Put these into a utils module or something
+async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
+    let mut retries = 3;
+    while retries != 0 {
+        retries -= 1;
+        let result = veilid
+            .new_custom_private_route(
+                &VALID_CRYPTO_KINDS,
+                veilid_core::Stability::LowLatency,
+                veilid_core::Sequencing::NoPreference,
+            )
+            .await;
+
+        if let Ok(route_blob) = result {
+            return Ok((route_blob.route_id, route_blob.blob));
+        }
+    }
+    Err(anyhow!("Unable to create route, reached max retries"))
+}
+
+fn config_for_dir(base_dir: PathBuf, namespace: Option<String>) -> VeilidConfig {
+    let namespace: String = namespace.unwrap_or_else(|| "iroh-blobs".to_string());
+    VeilidConfig {
+        program_name: "iroh-blobs".to_string(),
+        namespace,
+        protected_store: veilid_core::VeilidConfigProtectedStore {
+            // avoid prompting for password, don't do this in production
+            always_use_insecure_storage: true,
+            directory: base_dir
+                .join("protected_store")
+                .to_string_lossy()
+                .to_string(),
+            ..Default::default()
+        },
+        table_store: veilid_core::VeilidConfigTableStore {
+            directory: base_dir.join("table_store").to_string_lossy().to_string(),
+            ..Default::default()
+        },
+        block_store: veilid_core::VeilidConfigBlockStore {
+            directory: base_dir.join("block_store").to_string_lossy().to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -37,9 +142,9 @@ mod tests {
             .unwrap()
             .as_nanos();
         let mut dir = PathBuf::from(".veilid-test");
-        dir.push(format!("{}-{}", test_name, timestamp));
+        dir.push(format!("{test_name}-{timestamp}"));
         // Create unique namespace - this is critical for Veilid's global INITIALIZED HashSet
-        let namespace = format!("{}-{}", test_name, timestamp);
+        let namespace = format!("{test_name}-{timestamp}");
         (dir, namespace)
     }
 
@@ -75,16 +180,15 @@ mod tests {
         let read_update1 = read_update;
         let read_update2 = send_update.subscribe();
 
-        let (veilid, mut rx) =
-            crate::init_veilid(Some(namespace), &base_dir)
-                .await
-                .expect("Unable to init veilid and store");
+        let (veilid, mut rx) = crate::init_veilid(Some(namespace), &base_dir)
+            .await
+            .expect("Unable to init veilid and store");
 
         let sender_handle = tokio::spawn(async move {
             while let Ok(update) = rx.recv().await {
                 //println!("Received update: {:#?}", update);
                 if let Err(err) = send_update.send(update) {
-                    eprintln!("Unable to process veilid update: {:?}", err);
+                    eprintln!("Unable to process veilid update: {err:?}");
                 }
             }
         });
@@ -106,7 +210,7 @@ mod tests {
         println!("Routes ready");
 
         let on_new_tunnel1: OnNewTunnelCallback = Arc::new(move |tunnel| {
-            println!("New tunnel {:?}", tunnel);
+            println!("New tunnel {tunnel:?}");
 
             let send_result1 = send_result1.clone();
 
@@ -133,7 +237,7 @@ mod tests {
                     send_result1.send(Ok(())).await.unwrap();
                 } else {
                     send_result1
-                        .send(Err(anyhow!("Got invalid message from tunnel {0}", message)))
+                        .send(Err(anyhow!("Got invalid message from tunnel {message}")))
                         .await
                         .unwrap();
                 }
@@ -224,17 +328,17 @@ mod tests {
             match result {
                 Err(_) => {
                     send_result2
-                        .send(Err(anyhow!("Timeout waiting for tunnel response (network timing issue)")))
+                        .send(Err(anyhow!(
+                            "Timeout waiting for tunnel response (network timing issue)"
+                        )))
                         .await
                         .unwrap();
-                    return;
                 }
                 Ok(None) => {
                     send_result2
                         .send(Err(anyhow!("Tunnel closed before receiving response")))
                         .await
                         .unwrap();
-                    return;
                 }
                 Ok(Some(raw)) => {
                     let message = str::from_utf8(raw.as_slice()).unwrap();
@@ -243,7 +347,7 @@ mod tests {
                         send_result2.send(Ok(())).await.unwrap();
                     } else {
                         send_result2
-                            .send(Err(anyhow!("Got invalid message from tunnel {0}", message)))
+                            .send(Err(anyhow!("Got invalid message from tunnel {message}")))
                             .await
                             .unwrap();
                     }
@@ -288,7 +392,7 @@ mod tests {
             while let Ok(update) = rx.recv().await {
                 //println!("Received update: {:#?}", update);
                 if let Err(err) = send_update.send(update) {
-                    eprintln!("Unable to process veilid update: {:?}", err);
+                    eprintln!("Unable to process veilid update: {err:?}");
                 }
             }
         });
@@ -354,7 +458,7 @@ mod tests {
             .await
             .unwrap();
 
-        println!("Hash of README: {0}", hash);
+        println!("Hash of README: {hash}");
 
         let receiver = blobs.read_file(hash).await.unwrap();
 
@@ -362,11 +466,11 @@ mod tests {
 
         let data = stream.next().await;
 
-        println!("{:?}", data);
+        println!("{data:?}");
 
         let has = blobs.has_hash(&hash).await;
 
-        println!("Blobs has hash: {}", has);
+        println!("Blobs has hash: {has}");
 
         shutdown_blobs(blobs).await;
     }
@@ -374,7 +478,9 @@ mod tests {
     #[tokio::test]
     async fn test_blob_replication() {
         let (base_dir, namespace) = get_test_config("test_blob_replication");
-        let (veilid, mut rx) = crate::init_veilid(Some(namespace), &base_dir).await.unwrap();
+        let (veilid, mut rx) = crate::init_veilid(Some(namespace), &base_dir)
+            .await
+            .unwrap();
 
         let (send_update, read_update) = broadcast::channel::<VeilidUpdate>(256);
         let read_update1 = read_update;
@@ -383,12 +489,12 @@ mod tests {
         let sender_handle = tokio::spawn(async move {
             while let Result::Ok(update) = rx.recv().await {
                 if let VeilidUpdate::RouteChange(change) = update {
-                    println!("Route change {:?}", change);
+                    println!("Route change {change:?}");
                     continue;
                 }
                 //println!("Received update: {:#?}", update);
                 if let Err(err) = send_update.send(update) {
-                    eprintln!("Unable to process veilid update: {:?}", err);
+                    eprintln!("Unable to process veilid update: {err:?}");
                 }
             }
         });
@@ -460,7 +566,7 @@ mod tests {
         let (base_dir, namespace) = get_test_config("test_create_collection");
 
         // Log: Initializing blobs instance
-        println!("Initializing blobs instance from directory: {:?}", base_dir);
+        println!("Initializing blobs instance from directory: {base_dir:?}");
 
         // Initialize the blobs instance
         let blobs = VeilidIrohBlobs::from_directory(&base_dir, Some(namespace), None, None)
@@ -483,7 +589,7 @@ mod tests {
             "Collection hash should not be empty"
         );
 
-        println!("The collection was created with hash: {}", collection_hash);
+        println!("The collection was created with hash: {collection_hash}");
 
         // Verify that the collection exists in the store
         let has_collection = blobs.has_hash(&collection_hash).await;
@@ -517,7 +623,7 @@ mod tests {
             !collection_hash.as_bytes().is_empty(),
             "Collection hash should not be empty"
         );
-        println!("Created collection with hash: {}", collection_hash);
+        println!("Created collection with hash: {collection_hash}");
 
         // Test set_file
         let file_path = "test_file.txt".to_string();
@@ -532,10 +638,10 @@ mod tests {
         let file_hash = blobs.upload_from_path(temp_file_path).await.unwrap();
 
         // Add debug statements
-        println!("File hash: {}", file_hash);
+        println!("File hash: {file_hash}");
 
         let has_file = blobs.has_hash(&file_hash).await;
-        println!("Has file: {}", has_file);
+        println!("Has file: {has_file}");
         assert!(has_file, "Store should have the file hash after upload");
 
         let updated_collection_hash = blobs
@@ -638,19 +744,16 @@ mod tests {
             !collection_hash.as_bytes().is_empty(),
             "Collection hash should not be empty"
         );
-        println!("Created collection with hash: {}", collection_hash);
+        println!("Created collection with hash: {collection_hash}");
 
         // Attempt to retrieve the tag
-        println!(
-            "Attempting to retrieve tag for collection: {}",
-            collection_name
-        );
+        println!("Attempting to retrieve tag for collection: {collection_name}");
         match blobs.get_tag(&collection_name).await {
             Ok(tag_hash) => {
-                println!("Successfully retrieved tag: {:?}", tag_hash);
+                println!("Successfully retrieved tag: {tag_hash:?}");
             }
             Err(e) => {
-                println!("Error retrieving tag: {:?}", e);
+                println!("Error retrieving tag: {e:?}");
             }
         }
 
@@ -661,10 +764,10 @@ mod tests {
         let temp_file_path = std::fs::canonicalize(temp_file_path).unwrap();
 
         let file_hash = blobs.upload_from_path(temp_file_path).await.unwrap();
-        println!("File hash: {}", file_hash);
+        println!("File hash: {file_hash}");
 
         let has_file = blobs.has_hash(&file_hash).await;
-        println!("Has file: {}", has_file);
+        println!("Has file: {has_file}");
         assert!(has_file, "Store should have the file hash after upload");
 
         let updated_collection_hash = blobs
@@ -875,10 +978,7 @@ mod tests {
 
         // Attempt to retrieve a file from a non-existent collection
         let result = blobs
-            .get_file(
-                &"non_existent_collection".to_string(),
-                &"some_file.txt".to_string(),
-            )
+            .get_file("non_existent_collection", "some_file.txt")
             .await;
         assert!(
             result.is_err(),
@@ -886,9 +986,7 @@ mod tests {
         );
 
         // Attempt to list files in a non-existent collection
-        let result = blobs
-            .list_files(&"non_existent_collection".to_string())
-            .await;
+        let result = blobs.list_files("non_existent_collection").await;
         assert!(
             result.is_err(),
             "Listing files from non-existent collection should fail"
@@ -948,107 +1046,5 @@ mod tests {
         );
 
         shutdown_blobs(blobs).await;
-    }
-}
-
-async fn init_veilid(
-    namespace: Option<String>,
-    base_dir: &Path,
-) -> Result<(VeilidAPI, Receiver<VeilidUpdate>)> {
-    let config_inner = config_for_dir(base_dir.to_path_buf(), namespace);
-
-    let (tx, mut rx) = broadcast::channel(32);
-
-    let update_callback: UpdateCallback = Arc::new(move |update| {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            if tx.send(update).is_err() {
-                // TODO:
-                println!("receiver dropped");
-            }
-        });
-    });
-
-    println!("Init veilid");
-    let veilid = veilid_core::api_startup(update_callback, config_inner).await?;
-
-    println!("Attach veilid");
-
-    veilid.attach().await?;
-
-    println!("Wait for veilid network");
-
-    while let Ok(update) = rx.recv().await {
-        if let VeilidUpdate::Attachment(attachment_state) = update {
-            if attachment_state.public_internet_ready && attachment_state.state.is_attached() {
-                println!("Public internet ready!");
-                break;
-            }
-        }
-    }
-
-    println!("Network ready");
-
-    Ok((veilid, rx))
-}
-
-async fn init_deps(
-    namespace: Option<String>,
-    base_dir: &Path,
-) -> Result<(
-    VeilidAPI,
-    Receiver<VeilidUpdate>,
-    iroh_blobs::store::fs::Store,
-)> {
-    let store = iroh_blobs::store::fs::Store::load(base_dir.join("iroh")).await?;
-
-    let (veilid, rx) = init_veilid(namespace, base_dir).await?;
-
-    Ok((veilid, rx, store))
-}
-
-// TODO: Put these into a utils module or something
-async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
-    let mut retries = 3;
-    while retries != 0 {
-        retries -= 1;
-        let result = veilid
-            .new_custom_private_route(
-                &VALID_CRYPTO_KINDS,
-                veilid_core::Stability::LowLatency,
-                veilid_core::Sequencing::NoPreference,
-            )
-            .await;
-
-        if let Ok(route_blob) = result {
-            return Ok((route_blob.route_id, route_blob.blob));
-        }
-    }
-    Err(anyhow!("Unable to create route, reached max retries"))
-}
-
-fn config_for_dir(base_dir: PathBuf, namespace: Option<String>) -> VeilidConfig {
-    let namespace: String = namespace.unwrap_or_else(|| "iroh-blobs".to_string());
-    VeilidConfig {
-        program_name: "iroh-blobs".to_string(),
-        namespace,
-        protected_store: veilid_core::VeilidConfigProtectedStore {
-            // avoid prompting for password, don't do this in production
-            always_use_insecure_storage: true,
-            directory: base_dir
-                .join("protected_store")
-                .to_string_lossy()
-                .to_string(),
-            ..Default::default()
-        },
-        table_store: veilid_core::VeilidConfigTableStore {
-            directory: base_dir.join("table_store").to_string_lossy().to_string(),
-            ..Default::default()
-        },
-        block_store: veilid_core::VeilidConfigBlockStore {
-            directory: base_dir.join("block_store").to_string_lossy().to_string(),
-            ..Default::default()
-        },
-        ..Default::default()
     }
 }
