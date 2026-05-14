@@ -33,6 +33,11 @@ pub enum TunnelResult {
     Closed = 2,
 }
 
+enum TunnelError {
+    InvalidFrame(anyhow::Error),
+    Delivery(anyhow::Error),
+}
+
 impl TryFrom<u8> for TunnelResult {
     type Error = anyhow::Error;
 
@@ -225,18 +230,18 @@ impl TunnelManager {
         inner.senders.contains_key(id)
     }
 
-    async fn handle_message(&self, id: &TunnelId, message: &[u8]) -> Result<()> {
+    async fn handle_message(&self, id: &TunnelId, message: &[u8]) -> Result<(), TunnelError> {
         if self.has_tunnel(id).await {
             // TODO: Log failed requests?
             if let Err(err) = self.send_to_tunnel(id, message).await {
                 let route_id = self.route_id().await;
                 error!(route_id = ?route_id, error = ?err, "Unable to send data to tunnel");
-                return Err(err);
+                return Err(TunnelError::Delivery(err));
             }
         } else if let Err(err) = self.handle_new(id, message).await {
             let route_id = self.route_id().await;
             error!(route_id = ?route_id, error = ?err, "Unable to handle new tunnel");
-            return Err(err);
+            return Err(TunnelError::InvalidFrame(err));
         }
 
         Ok(())
@@ -292,8 +297,12 @@ impl TunnelManager {
 
         match self.handle_message(&id, bytes).await {
             Ok(_) => self.app_call_reply(call_id, TunnelResult::Success).await,
-            Err(_) => {
+            Err(TunnelError::InvalidFrame(_)) => {
                 self.app_call_reply(call_id, TunnelResult::InvalidFormat)
+                    .await
+            }
+            Err(TunnelError::Delivery(_)) => {
+                self.app_call_reply(call_id, TunnelResult::Closed)
                     .await
             }
         }
