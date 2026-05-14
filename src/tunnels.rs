@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Mutex;
+use tracing::error;
 use veilid_core::OperationId;
 use veilid_core::VeilidAPI;
 use veilid_core::VeilidAppCall;
@@ -228,19 +229,13 @@ impl TunnelManager {
         if self.has_tunnel(id).await {
             // TODO: Log failed requests?
             if let Err(err) = self.send_to_tunnel(id, message).await {
-                eprintln!(
-                    "{0} Unable to send data to tunnel {1:?}",
-                    self.route_id().await,
-                    err
-                );
+                let route_id = self.route_id().await;
+                error!(route_id = ?route_id, error = ?err, "Unable to send data to tunnel");
                 return Err(err);
             }
         } else if let Err(err) = self.handle_new(id, message).await {
-            eprintln!(
-                "{0} Unable to handle new tunnel {1:?}",
-                self.route_id().await,
-                err
-            );
+            let route_id = self.route_id().await;
+            error!(route_id = ?route_id, error = ?err, "Unable to handle new tunnel");
             return Err(err);
         }
 
@@ -274,7 +269,7 @@ impl TunnelManager {
         let route_key = match RouteId::try_from(route_id_buffer.to_vec()) {
             Ok(route_key) => route_key,
             Err(err) => {
-                eprintln!("Failed to parse tunnel route id: {err}");
+                error!(error = ?err, "Failed to parse tunnel route id");
                 return self
                     .app_call_reply(call_id, TunnelResult::InvalidFormat)
                     .await;
