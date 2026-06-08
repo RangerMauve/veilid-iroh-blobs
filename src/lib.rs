@@ -108,6 +108,7 @@ mod tests {
     use core::str;
     use futures_lite::StreamExt;
     use std::path::Path;
+    use std::time::Instant;
     use std::{path::PathBuf, sync::Arc};
     use tokio::sync::broadcast;
     use tokio::sync::mpsc;
@@ -135,6 +136,12 @@ mod tests {
         // Veilid needs substantial time to fully release all global resources
         // Even though shutdown().await completes, internal cleanup continues
         sleep(Duration::from_secs(5)).await;
+    }
+
+    fn deterministic_payload(size: usize) -> Vec<u8> {
+        (0..size)
+            .map(|index| ((index * 31 + 17) % 251) as u8)
+            .collect()
     }
 
     #[tokio::test]
@@ -538,6 +545,114 @@ mod tests {
         blobs2.shutdown().await.unwrap();
         blobs1.shutdown().await.unwrap();
         // Give Veilid time to fully clean up
+        sleep(Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "manual transfer sweep for Veilid/Iroh route performance"]
+    async fn test_blob_replication_size_sweep() {
+        let (base_dir, namespace) = get_test_config("test_blob_replication_size_sweep");
+        let (veilid, mut rx) = crate::init_veilid(Some(namespace), &base_dir)
+            .await
+            .unwrap();
+
+        let (send_update, read_update) = broadcast::channel::<VeilidUpdate>(256);
+        let read_update1 = read_update;
+        let read_update2 = send_update.subscribe();
+
+        let sender_handle = tokio::spawn(async move {
+            while let Result::Ok(update) = rx.recv().await {
+                if let VeilidUpdate::RouteChange(change) = update {
+                    println!("Route change {change:?}");
+                    continue;
+                }
+                if let Err(err) = send_update.send(update) {
+                    eprintln!("Unable to process veilid update: {err:?}");
+                }
+            }
+        });
+
+        let v1 = veilid.clone();
+        let v2 = veilid.clone();
+
+        let store1_dir = base_dir.join("peer1");
+        let store1 = iroh_blobs::store::fs::Store::load(store1_dir)
+            .await
+            .unwrap();
+
+        let store2_dir = base_dir.join("peer2");
+        let store2 = iroh_blobs::store::fs::Store::load(store2_dir)
+            .await
+            .unwrap();
+        let router1 = v1.routing_context().unwrap();
+        let (route_id1, route_id1_blob) = crate::make_route(&v1).await.unwrap();
+
+        let router2 = v2.routing_context().unwrap();
+        let (route_id2, route_id2_blob) = crate::make_route(&v2).await.unwrap();
+
+        let blobs1 = VeilidIrohBlobs::new(VeilidIrohBlobsConfig {
+            veilid: v1,
+            router: router1,
+            route_id_blob: route_id1_blob,
+            route_id: route_id1,
+            updates: read_update1,
+            store: store1,
+            on_route_disconnected_callback: None,
+            on_new_route_callback: None,
+        });
+        let blobs2 = VeilidIrohBlobs::new(VeilidIrohBlobsConfig {
+            veilid: v2,
+            router: router2,
+            route_id_blob: route_id2_blob,
+            route_id: route_id2,
+            updates: read_update2,
+            store: store2,
+            on_route_disconnected_callback: None,
+            on_new_route_callback: None,
+        });
+
+        for size in [13 * 1024, 25 * 1024, 64 * 1024, 256 * 1024] {
+            let payload = deterministic_payload(size);
+            let payload_path = base_dir.join(format!("payload-{size}.bin"));
+            std::fs::write(&payload_path, &payload).unwrap();
+            let hash = blobs1
+                .upload_from_path(std::fs::canonicalize(payload_path).unwrap())
+                .await
+                .unwrap();
+
+            let expected_data_calls =
+                (size + crate::iroh::FILE_CHUNK_SIZE - 1) / crate::iroh::FILE_CHUNK_SIZE;
+            let started = Instant::now();
+            blobs2
+                .download_file_from(blobs1.route_id_blob().await, &hash)
+                .await
+                .unwrap();
+            let elapsed = started.elapsed();
+
+            let has = blobs2.has_hash(&hash).await;
+            assert!(has, "peer should have hash after {size}-byte download");
+
+            let receiver = blobs2.read_file(hash).await.unwrap();
+            let mut stream = tokio_stream::wrappers::ReceiverStream::new(receiver);
+            let mut downloaded = Vec::with_capacity(size);
+            while let Some(chunk) = stream.next().await {
+                downloaded.extend_from_slice(&chunk.unwrap());
+            }
+
+            assert_eq!(
+                downloaded, payload,
+                "downloaded payload should match for {size} bytes"
+            );
+            println!(
+                "FILE_SIZE_SWEEP size={size} chunk_size={} expected_data_calls={expected_data_calls} elapsed_ms={}",
+                crate::iroh::FILE_CHUNK_SIZE,
+                elapsed.as_millis()
+            );
+        }
+
+        sender_handle.abort();
+        blobs2.shutdown().await.unwrap();
+        blobs1.shutdown().await.unwrap();
         sleep(Duration::from_secs(5)).await;
     }
 
