@@ -69,36 +69,6 @@ pub struct TunnelManager {
 }
 
 impl TunnelManagerInner {
-    async fn send_ping(&self, id: &TunnelId) -> Result<()> {
-        let mut bytes = PING_BYTES.to_vec();
-        bytes.extend(self.route_id_blob.clone());
-        self.send_bytes(id, bytes).await
-    }
-
-    async fn send_bytes(&self, id: &TunnelId, bytes: Vec<u8>) -> Result<()> {
-        let route_id_bytes = Vec::from(self.route_id.clone());
-        let mut buffer: BytesMut = BytesMut::with_capacity(bytes.len() + 4 + route_id_bytes.len());
-        buffer.put(route_id_bytes.as_slice());
-        buffer.put_u32(id.1);
-        buffer.put(bytes.as_slice());
-        let target = Target::RouteId(id.0.clone());
-        let result = self.router.app_call(target, buffer.to_vec()).await?;
-
-        if result.len() != 1 {
-            return Err(anyhow!(
-                "Got invalid response length from app call: {result:?}"
-            ));
-        }
-
-        let code: TunnelResult = result[0].try_into()?;
-
-        match code {
-            TunnelResult::Success => Ok(()),
-            TunnelResult::Closed => Err(anyhow!("Tunnel closed")),
-            TunnelResult::InvalidFormat => Err(anyhow!("Invalid Format")),
-        }
-    }
-
     async fn notify_bytes(&self, id: &TunnelId, bytes: &[u8]) -> Result<()> {
         let sender = self.senders.get(id);
         if sender.is_none() {
@@ -147,6 +117,45 @@ impl TunnelManagerInner {
 }
 
 impl TunnelManager {
+    async fn send_ping(&self, id: &TunnelId) -> Result<()> {
+        let route_id_blob = {
+            let inner = self.inner.lock().await;
+            inner.route_id_blob.clone()
+        };
+        let mut bytes = PING_BYTES.to_vec();
+        bytes.extend(route_id_blob);
+        self.send_bytes(id, bytes).await
+    }
+
+    async fn send_bytes(&self, id: &TunnelId, bytes: Vec<u8>) -> Result<()> {
+        let (router, route_id) = {
+            let inner = self.inner.lock().await;
+            (inner.router.clone(), inner.route_id.clone())
+        };
+
+        let route_id_bytes = Vec::from(route_id);
+        let mut buffer: BytesMut = BytesMut::with_capacity(bytes.len() + 4 + route_id_bytes.len());
+        buffer.put(route_id_bytes.as_slice());
+        buffer.put_u32(id.1);
+        buffer.put(bytes.as_slice());
+        let target = Target::RouteId(id.0.clone());
+        let result = router.app_call(target, buffer.to_vec()).await?;
+
+        if result.len() != 1 {
+            return Err(anyhow!(
+                "Got invalid response length from app call: {result:?}"
+            ));
+        }
+
+        let code: TunnelResult = result[0].try_into()?;
+
+        match code {
+            TunnelResult::Success => Ok(()),
+            TunnelResult::Closed => Err(anyhow!("Tunnel closed")),
+            TunnelResult::InvalidFormat => Err(anyhow!("Invalid Format")),
+        }
+    }
+
     fn new_tunnel_route_blob(message: &[u8]) -> Result<&[u8]> {
         if message.len() < PING_BYTES.len() {
             return Err(anyhow!(
@@ -176,7 +185,7 @@ impl TunnelManager {
             inner.senders.insert(id.clone(), man_to_tun);
         }
 
-        let inner = self.inner.clone();
+        let manager = self.clone();
         let id = id.clone();
         let route_id = self.route_id().await;
 
@@ -186,8 +195,7 @@ impl TunnelManager {
                     // Signal that the tunnel is closed
                     break;
                 }
-                let inner = inner.lock().await;
-                let result = inner.send_bytes(&id, bytes).await;
+                let result = manager.send_bytes(&id, bytes).await;
                 if result.is_err() {
                     // TODO: report tunnel close somewhere? Should close one end once we break
                     eprint!("{0} Unable to read {1}", route_id, result.unwrap_err());
@@ -402,10 +410,7 @@ impl TunnelManager {
 
         let tunnel = self.track(&id).await?;
 
-        {
-            let inner = self.inner.lock().await;
-            inner.send_ping(&id).await?;
-        }
+        self.send_ping(&id).await?;
 
         Ok(tunnel)
     }

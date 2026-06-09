@@ -7,7 +7,6 @@ use crate::tunnels::Tunnel;
 use crate::tunnels::TunnelManager;
 
 use anyhow::anyhow;
-use anyhow::Ok;
 use anyhow::Result;
 use bytes::BufMut;
 use bytes::Bytes;
@@ -49,6 +48,7 @@ const DONE: u8 = 0x22u8;
 const ERR: u8 = 0xF0u8;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(32000);
+pub(crate) const FILE_CHUNK_SIZE: usize = 16 * 1024;
 
 pub struct VeilidIrohBlobsConfig {
     pub veilid: VeilidAPI,
@@ -192,6 +192,11 @@ impl VeilidIrohBlobs {
         }
 
         if let Some(message) = read_result.unwrap() {
+            if message.is_empty() {
+                let _ = send.send(vec![ERR]).await;
+                return;
+            }
+
             let command = message[0];
             let hash_bytes = &message[1..];
             if command == ASK || command == HAS {
@@ -211,34 +216,97 @@ impl VeilidIrohBlobs {
                 }
                 if command == ASK {
                     if let Result::Ok(mut file) = self.read_file(hash).await {
-                        while let Result::Ok(read_result) =
-                            timeout(DEFAULT_TIMEOUT, file.recv()).await
-                        {
-                            if read_result.is_none() {
-                                break;
-                            }
-                            let chunk = read_result.unwrap();
-                            if chunk.is_err() {
-                                let _ = send.send(vec![ERR]).await;
-                                return;
-                            } else {
-                                let chunk = chunk.unwrap();
-                                let mut to_send = BytesMut::with_capacity(chunk.len() + 1);
-                                to_send.put_u8(DATA);
-                                to_send.put(chunk);
+                        loop {
+                            match timeout(DEFAULT_TIMEOUT, file.recv()).await {
+                                Ok(Some(Ok(chunk))) => {
+                                    let mut to_send = BytesMut::with_capacity(chunk.len() + 1);
+                                    to_send.put_u8(DATA);
+                                    to_send.put(chunk);
 
-                                if send.send(to_send.to_vec()).await.is_err() {
+                                    if send.send(to_send.to_vec()).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                Ok(Some(Err(_))) => {
+                                    let _ = send.send(vec![ERR]).await;
+                                    return;
+                                }
+                                Ok(None) => {
+                                    let _ = send.send(vec![DONE]).await;
+                                    return;
+                                }
+                                Err(_) => {
+                                    let _ = send.send(vec![ERR]).await;
                                     return;
                                 }
                             }
                         }
-                        let _ = send.send(vec![DONE]).await;
                     } else {
                         let _ = send.send(vec![ERR]).await;
                     }
                 }
             } else {
                 let _ = send.send(vec![ERR]).await;
+            }
+        }
+    }
+
+    async fn forward_download_messages(
+        mut read: mpsc::Receiver<Vec<u8>>,
+        send_file: mpsc::Sender<std::io::Result<Bytes>>,
+        receive_timeout: Duration,
+    ) {
+        loop {
+            match timeout(receive_timeout, read.recv()).await {
+                Ok(Some(message)) => {
+                    if message.is_empty() {
+                        let _ = send_file
+                            .send(std::io::Result::Err(std::io::Error::new(
+                                ErrorKind::InvalidData,
+                                "Peer sent empty message",
+                            )))
+                            .await;
+                        return;
+                    }
+
+                    let command = message[0];
+                    if command == DONE {
+                        return;
+                    }
+
+                    if command != DATA {
+                        let _ = send_file
+                            .send(std::io::Result::Err(std::io::Error::new(
+                                ErrorKind::InvalidData,
+                                format!("Peer sent unexpected command {command}"),
+                            )))
+                            .await;
+                        return;
+                    }
+
+                    let bytes = Bytes::copy_from_slice(&message[1..]);
+                    if send_file.send(std::io::Result::Ok(bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    let _ = send_file
+                        .send(std::io::Result::Err(std::io::Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "Peer closed before sending DONE",
+                        )))
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = send_file
+                        .send(std::io::Result::Err(std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            "Timed out waiting for peer DATA/DONE",
+                        )))
+                        .await;
+                    return;
+                }
             }
         }
     }
@@ -334,41 +402,7 @@ impl VeilidIrohBlobs {
             let (send_file, read_file) = mpsc::channel::<std::io::Result<Bytes>>(2);
 
             tokio::spawn(async move {
-                while let Result::Ok(read_result) = timeout(DEFAULT_TIMEOUT, read.recv()).await {
-                    if read_result.is_none() {
-                        break;
-                    }
-                    let message = read_result.unwrap();
-
-                    if message.is_empty() {
-                        let _ = send_file
-                            .send(std::io::Result::Err(std::io::Error::new(
-                                ErrorKind::InvalidData,
-                                "Peer sent empty message",
-                            )))
-                            .await;
-                        return;
-                    }
-                    let command = message[0];
-
-                    if command == DONE {
-                        break;
-                    }
-
-                    if command != DATA {
-                        let _ = send_file
-                            .send(std::io::Result::Err(std::io::Error::new(
-                                ErrorKind::InvalidData,
-                                format!("Peer sent unexpected command {command}"),
-                            )))
-                            .await;
-                        return;
-                    }
-                    let bytes = Bytes::from_iter(message[1..].to_vec());
-                    if send_file.send(std::io::Result::Ok(bytes)).await.is_err() {
-                        return;
-                    }
-                }
+                Self::forward_download_messages(read, send_file, DEFAULT_TIMEOUT).await;
             });
             let got_hash = self.upload_from_stream(read_file).await?;
 
@@ -433,20 +467,18 @@ impl VeilidIrohBlobs {
         let mut reader = handle.unwrap().data_reader();
         let size = reader.size().await? as usize;
 
-        let chunk_size = 1024usize; // TODO: what's a good chunk size for veilid messages?
-
         let (send, read) = mpsc::channel::<std::io::Result<Bytes>>(2);
 
         tokio::spawn(async move {
             let mut index = 0usize;
             while index < size {
-                let chunk = reader.read_at(index as u64, chunk_size).await;
+                let chunk = reader.read_at(index as u64, FILE_CHUNK_SIZE).await;
 
                 if let Err(err) = send.send(chunk).await {
                     eprintln!("Cannot send down channel {err:?}");
                     return;
                 }
-                index += chunk_size
+                index += FILE_CHUNK_SIZE
             }
         });
 
@@ -767,5 +799,70 @@ impl VeilidIrohBlobs {
 
     pub async fn route_id_blob(&self) -> Vec<u8> {
         self.tunnels.route_id_blob().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn forward_download_messages_stops_on_done() {
+        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (output_tx, mut output_rx) = mpsc::channel::<std::io::Result<Bytes>>(4);
+
+        let handle = tokio::spawn(async move {
+            VeilidIrohBlobs::forward_download_messages(input_rx, output_tx, Duration::from_secs(1))
+                .await;
+        });
+
+        input_tx.send(vec![DATA, 1, 2, 3]).await.unwrap();
+        input_tx.send(vec![DONE]).await.unwrap();
+
+        let bytes = output_rx.recv().await.unwrap().unwrap();
+        assert_eq!(bytes, Bytes::from_static(&[1, 2, 3]));
+        assert!(output_rx.recv().await.is_none());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forward_download_messages_errors_when_peer_closes_before_done() {
+        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (output_tx, mut output_rx) = mpsc::channel::<std::io::Result<Bytes>>(4);
+
+        drop(input_tx);
+        VeilidIrohBlobs::forward_download_messages(input_rx, output_tx, Duration::from_secs(1))
+            .await;
+
+        let err = output_rx.recv().await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("before sending DONE"));
+    }
+
+    #[tokio::test]
+    async fn forward_download_messages_errors_on_timeout() {
+        let (_input_tx, input_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (output_tx, mut output_rx) = mpsc::channel::<std::io::Result<Bytes>>(4);
+
+        VeilidIrohBlobs::forward_download_messages(input_rx, output_tx, Duration::from_millis(1))
+            .await;
+
+        let err = output_rx.recv().await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        assert!(err.to_string().contains("Timed out"));
+    }
+
+    #[tokio::test]
+    async fn forward_download_messages_rejects_invalid_frames() {
+        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (output_tx, mut output_rx) = mpsc::channel::<std::io::Result<Bytes>>(4);
+
+        input_tx.send(vec![ERR]).await.unwrap();
+        VeilidIrohBlobs::forward_download_messages(input_rx, output_tx, Duration::from_secs(1))
+            .await;
+
+        let err = output_rx.recv().await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unexpected command"));
     }
 }
