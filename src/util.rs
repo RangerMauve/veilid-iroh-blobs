@@ -10,7 +10,7 @@ pub async fn make_route(veilid: &VeilidAPI) -> Result<(RouteId, Vec<u8>)> {
                 crypto_kinds: VALID_CRYPTO_KINDS.to_vec(),
                 hop_count: 0,
                 stability: Stability::LowLatency,
-                sequencing: Sequencing::NoPreference,
+                sequencing: Sequencing::PreferUnordered,
             })
             .await;
 

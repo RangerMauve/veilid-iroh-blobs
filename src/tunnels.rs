@@ -341,7 +341,7 @@ impl TunnelManager {
                 crypto_kinds: veilid_core::VALID_CRYPTO_KINDS.to_vec(),
                 hop_count: 0,
                 stability: veilid_core::Stability::LowLatency,
-                sequencing: veilid_core::Sequencing::NoPreference,
+                sequencing: veilid_core::Sequencing::PreferUnordered,
             })
             .await?;
         let route_id = route_blob.route_id;

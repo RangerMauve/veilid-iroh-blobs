@@ -48,7 +48,8 @@ const DONE: u8 = 0x22u8;
 const ERR: u8 = 0xF0u8;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(32000);
-pub(crate) const FILE_CHUNK_SIZE: usize = 16 * 1024;
+// Veilid app_call payloads are capped at 32 KiB; leave room for tunnel headers.
+pub(crate) const FILE_CHUNK_SIZE: usize = 28 * 1024;
 
 pub struct VeilidIrohBlobsConfig {
     pub veilid: VeilidAPI,
